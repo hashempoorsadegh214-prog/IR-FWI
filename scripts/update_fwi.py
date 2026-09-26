@@ -2,19 +2,42 @@
 
 """
 IR-FWI
-Diagnostic build of Iran ECMWF FWI from Copernicus GWIS WMS.
+Diagnostic internal-boundary overlay test.
 
-This version keeps the existing WMS -> GeoTIFF -> Iran clip workflow,
-but adds detailed georeferencing diagnostics to GitHub Actions logs.
+Purpose
+-------
+This version tests whether the Iran boundary and the FWI raster
+occupy the same geographic grid.
 
-Outputs:
-    web/fwi_iran_latest.png
-    web/fwi_iran_latest.json
+Outputs
+-------
+web/fwi_iran_latest.png
+web/fwi_iran_latest.json
+web/fwi_iran_diagnostic_overlay.png
 
-Temporary:
-    tmp_fwi/fwi_iran_assembled.tif
-    tmp_fwi/fwi_iran_clipped.tif
+Temporary files
+---------------
+tmp_fwi/fwi_iran_assembled.tif
+tmp_fwi/fwi_iran_clipped.tif
+tmp_fwi/fwi_iran_boundary_overlay.tif
+
+The diagnostic overlay is generated in the SAME raster grid as
+the assembled FWI raster.
+
+This is important:
+we do not draw the boundary as a separate Leaflet layer.
+Instead, we rasterize IRAN.geojson directly onto the FWI grid.
+
+Therefore:
+
+If the boundary line is correctly located over the FWI image
+inside this diagnostic PNG, the WMS georeferencing is internally
+consistent.
+
+If the boundary line is visibly shifted relative to the FWI
+pattern, the problem is upstream of Leaflet.
 """
+
 
 from pathlib import Path
 import io
@@ -25,12 +48,13 @@ from datetime import datetime, timezone
 import numpy as np
 import requests
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 import geopandas as gpd
 
 import rasterio
 from rasterio.mask import mask
+from rasterio.features import rasterize
 from rasterio.transform import from_bounds, array_bounds
 from rasterio.warp import reproject, Resampling
 
@@ -46,7 +70,13 @@ BOUNDARY_FILE = BASE_DIR / "IRAN.geojson"
 WEB_DIR = BASE_DIR / "web"
 
 PNG_FILE = WEB_DIR / "fwi_iran_latest.png"
+
 JSON_FILE = WEB_DIR / "fwi_iran_latest.json"
+
+DIAGNOSTIC_FILE = (
+    WEB_DIR
+    / "fwi_iran_diagnostic_overlay.png"
+)
 
 TMP_DIR = BASE_DIR / "tmp_fwi"
 
@@ -55,9 +85,14 @@ TMP_DIR.mkdir(
     exist_ok=True
 )
 
+WEB_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
 
 # ============================================================
-# WMS
+# WMS CONFIGURATION
 # ============================================================
 
 WMS_URL = (
@@ -74,7 +109,7 @@ FORECAST_DATE = datetime.now(
 
 
 # ============================================================
-# TILE CONFIG
+# TILE CONFIGURATION
 # ============================================================
 
 NX = 3
@@ -93,7 +128,7 @@ EXPAND_DEGREES = 0.15
 
 
 # ============================================================
-# HTTP
+# HTTP SESSION
 # ============================================================
 
 SESSION = requests.Session()
@@ -104,7 +139,7 @@ SESSION.headers.update(
             "IR-FWI-GitHubActions/1.0"
         ),
         "Accept": (
-            "image/png,image/jpeg,image/*,"
+            "image/png,image/jpeg,image/*;"
             "q=0.8,*/*;q=0.5"
         ),
         "Accept-Encoding": "identity",
@@ -118,11 +153,14 @@ SESSION.headers.update(
 # ============================================================
 
 def log(message=""):
-    print(message, flush=True)
+    print(
+        message,
+        flush=True
+    )
 
 
 # ============================================================
-# BOUNDARY
+# LOAD IRAN BOUNDARY
 # ============================================================
 
 def load_boundary():
@@ -130,7 +168,8 @@ def load_boundary():
     if not BOUNDARY_FILE.exists():
 
         raise FileNotFoundError(
-            f"Boundary not found: {BOUNDARY_FILE}"
+            f"Boundary not found: "
+            f"{BOUNDARY_FILE}"
         )
 
     gdf = gpd.read_file(
@@ -157,61 +196,67 @@ def load_boundary():
 
 
 # ============================================================
-# BOUNDARY DIAGNOSTIC
+# BOUNDARY BBOX
 # ============================================================
 
-def boundary_diagnostic(gdf):
+def get_boundary_bbox(gdf):
 
     minx, miny, maxx, maxy = (
         gdf.total_bounds
     )
 
-    log("")
-    log("=" * 70)
-    log("BOUNDARY DIAGNOSTIC")
-    log("=" * 70)
-
-    log(
-        f"CRS: {gdf.crs}"
-    )
-
-    log(
-        f"West : {minx:.12f}"
-    )
-
-    log(
-        f"South: {miny:.12f}"
-    )
-
-    log(
-        f"East : {maxx:.12f}"
-    )
-
-    log(
-        f"North: {maxy:.12f}"
-    )
-
-    log(
-        f"Width : {maxx - minx:.12f} degrees"
-    )
-
-    log(
-        f"Height: {maxy - miny:.12f} degrees"
-    )
-
-    return (
+    bbox = (
         float(minx),
         float(miny),
         float(maxx),
         float(maxy),
     )
 
+    log("")
+    log("=" * 70)
+    log("IRAN BOUNDARY")
+    log("=" * 70)
+
+    log(
+        f"CRS   : {gdf.crs}"
+    )
+
+    log(
+        f"West  : {bbox[0]:.12f}"
+    )
+
+    log(
+        f"South : {bbox[1]:.12f}"
+    )
+
+    log(
+        f"East  : {bbox[2]:.12f}"
+    )
+
+    log(
+        f"North : {bbox[3]:.12f}"
+    )
+
+    log(
+        f"Width : "
+        f"{bbox[2] - bbox[0]:.12f}"
+    )
+
+    log(
+        f"Height: "
+        f"{bbox[3] - bbox[1]:.12f}"
+    )
+
+    return bbox
+
 
 # ============================================================
 # IMAGE VALIDATION
 # ============================================================
 
-def validate_image(content):
+def validate_image(
+    content
+):
 
     if not content:
 
@@ -239,7 +284,7 @@ def validate_image(content):
     except Exception as exc:
 
         raise RuntimeError(
-            f"Invalid image response: {exc}"
+            f"Invalid WMS image: {exc}"
         )
 
 
@@ -284,10 +329,7 @@ def request_wms(
             ),
         }
 
-    else:
-
-        # WMS 1.3.0 / EPSG:4326 axis order:
-        # latitude, longitude
+    elif version == "1.3.0":
 
         params = {
             "SERVICE": "WMS",
@@ -313,12 +355,21 @@ def request_wms(
             ),
         }
 
+    else:
+
+        raise ValueError(
+            f"Unsupported WMS version: "
+            f"{version}"
+        )
+
     last_error = None
 
     for attempt in range(
         1,
         MAX_ATTEMPTS + 1
     ):
+
+        response = None
 
         try:
 
@@ -347,13 +398,9 @@ def request_wms(
             log(
                 f"      Success: "
                 f"{len(content)} bytes "
-                f"{image.width}x{image.height}"
+                f"{image.width}x"
+                f"{image.height}"
             )
-
-            try:
-                response.close()
-            except Exception:
-                pass
 
             return image
 
@@ -362,19 +409,24 @@ def request_wms(
             last_error = exc
 
             log(
-                f"      Failed: {repr(exc)}"
+                f"      Failed: "
+                f"{repr(exc)}"
             )
-
-            try:
-                response.close()
-            except Exception:
-                pass
 
             if attempt < MAX_ATTEMPTS:
 
                 time.sleep(
                     SLEEP_SECONDS
                 )
+
+        finally:
+
+            if response is not None:
+
+                try:
+                    response.close()
+                except Exception:
+                    pass
 
     raise RuntimeError(
         f"WMS request failed: "
@@ -399,23 +451,23 @@ def fetch_tile(
     )
 
     log(
-        "    Requested BBOX:"
+        "    BBOX:"
     )
 
     log(
-        f"      west  = {bbox[0]:.12f}"
+        f"      W={bbox[0]:.12f}"
     )
 
     log(
-        f"      south = {bbox[1]:.12f}"
+        f"      S={bbox[1]:.12f}"
     )
 
     log(
-        f"      east  = {bbox[2]:.12f}"
+        f"      E={bbox[2]:.12f}"
     )
 
     log(
-        f"      north = {bbox[3]:.12f}"
+        f"      N={bbox[3]:.12f}"
     )
 
     methods = [
@@ -440,6 +492,7 @@ def fetch_tile(
             "image/png",
             True,
         ),
+
     ]
 
     for (
@@ -472,15 +525,12 @@ def fetch_tile(
         except Exception as exc:
 
             log(
-                f"    {method_name} failed:"
-            )
-
-            log(
-                f"      {repr(exc)}"
+                f"    Failed: "
+                f"{repr(exc)}"
             )
 
     # --------------------------------------------------------
-    # Expanded BBOX fallback
+    # EXPANDED BBOX
     # --------------------------------------------------------
 
     west, south, east, north = bbox
@@ -508,10 +558,6 @@ def fetch_tile(
             transparent=False,
         )
 
-        log(
-            "    Expanded BBOX succeeded."
-        )
-
         return (
             image.convert("RGBA"),
             expanded_bbox,
@@ -525,7 +571,7 @@ def fetch_tile(
         )
 
     raise RuntimeError(
-        f"All WMS methods failed for "
+        f"All WMS methods failed: "
         f"{tile_name}"
     )
 
@@ -561,14 +607,17 @@ def normalize_tile(
         ):
 
             image = image.resize(
-                (width, height),
+                (
+                    width,
+                    height
+                ),
                 Image.Resampling.BILINEAR,
             )
 
         return image
 
     # --------------------------------------------------------
-    # Expanded source -> exact requested grid
+    # Expanded image -> exact requested grid
     # --------------------------------------------------------
 
     source = np.asarray(
@@ -577,6 +626,7 @@ def normalize_tile(
     )
 
     src_height = source.shape[0]
+
     src_width = source.shape[1]
 
     src_transform = from_bounds(
@@ -601,7 +651,7 @@ def normalize_tile(
         (
             4,
             height,
-            width,
+            width
         ),
         dtype=np.uint8,
     )
@@ -631,23 +681,19 @@ def normalize_tile(
 
 
 # ============================================================
-# ASSEMBLE
+# ASSEMBLE TILES
 # ============================================================
 
 def assemble_tiles(
-    tiles,
-    nx,
-    ny,
-    tile_width,
-    tile_height,
+    tiles
 ):
 
     full_width = (
-        nx * tile_width
+        NX * TILE_WIDTH
     )
 
     full_height = (
-        ny * tile_height
+        NY * TILE_HEIGHT
     )
 
     canvas = Image.new(
@@ -659,32 +705,35 @@ def assemble_tiles(
         (0, 0, 0, 0),
     )
 
-    for y in range(ny):
+    for y in range(NY):
 
-        for x in range(nx):
+        for x in range(NX):
 
             image = tiles[
                 (y, x)
             ]
 
             px = (
-                x * tile_width
+                x * TILE_WIDTH
             )
 
             py = (
-                y * tile_height
+                y * TILE_HEIGHT
             )
 
             canvas.alpha_composite(
                 image,
-                (px, py),
+                (
+                    px,
+                    py
+                ),
             )
 
     return canvas
 
 
 # ============================================================
-# CREATE GEOTIFF
+# SAVE GEOTIFF
 # ============================================================
 
 def save_rgba_geotiff(
@@ -701,6 +750,7 @@ def save_rgba_geotiff(
     )
 
     height = rgba.shape[0]
+
     width = rgba.shape[1]
 
     transform = from_bounds(
@@ -745,7 +795,7 @@ def raster_diagnostic(
     log("")
     log("=" * 70)
     log(
-        f"RASTER DIAGNOSTIC: {label}"
+        f"RASTER: {label}"
     )
     log("=" * 70)
 
@@ -766,149 +816,454 @@ def raster_diagnostic(
         )
 
         log(
-            f"Transform:"
+            f"Transform: {src.transform}"
+        )
+
+        b = src.bounds
+
+        log(
+            f"West  : {b.left:.12f}"
         )
 
         log(
-            f"  {src.transform}"
-        )
-
-        bounds = src.bounds
-
-        log(
-            "Bounds:"
+            f"South : {b.bottom:.12f}"
         )
 
         log(
-            f"  west  = {bounds.left:.12f}"
+            f"East  : {b.right:.12f}"
         )
 
         log(
-            f"  south = {bounds.bottom:.12f}"
+            f"North : {b.top:.12f}"
         )
 
-        log(
-            f"  east  = {bounds.right:.12f}"
-        )
-
-        log(
-            f"  north = {bounds.top:.12f}"
-        )
-
-        calculated = array_bounds(
-            src.height,
-            src.width,
-            src.transform,
-        )
-
-        log(
-            "array_bounds:"
-        )
-
-        log(
-            f"  west  = {calculated[0]:.12f}"
-        )
-
-        log(
-            f"  south = {calculated[1]:.12f}"
-        )
-
-        log(
-            f"  east  = {calculated[2]:.12f}"
-        )
-
-        log(
-            f"  north = {calculated[3]:.12f}"
-        )
-
-        # ----------------------------------------------------
-        # Four raster corner coordinates
-        # ----------------------------------------------------
-
-        log("")
-        log(
-            "Four raster corners:"
-        )
+        # Four corners
 
         nw = src.transform * (
             0,
-            0,
+            0
         )
 
         ne = src.transform * (
             src.width,
-            0,
+            0
         )
 
         sw = src.transform * (
             0,
-            src.height,
+            src.height
         )
 
         se = src.transform * (
             src.width,
-            src.height,
+            src.height
+        )
+
+        log("")
+        log(
+            "Raster corners:"
         )
 
         log(
-            f"  NW = "
-            f"lon {nw[0]:.12f}, "
-            f"lat {nw[1]:.12f}"
+            f"NW = "
+            f"{nw[0]:.12f}, "
+            f"{nw[1]:.12f}"
         )
 
         log(
-            f"  NE = "
-            f"lon {ne[0]:.12f}, "
-            f"lat {ne[1]:.12f}"
+            f"NE = "
+            f"{ne[0]:.12f}, "
+            f"{ne[1]:.12f}"
         )
 
         log(
-            f"  SW = "
-            f"lon {sw[0]:.12f}, "
-            f"lat {sw[1]:.12f}"
+            f"SW = "
+            f"{sw[0]:.12f}, "
+            f"{sw[1]:.12f}"
         )
 
         log(
-            f"  SE = "
-            f"lon {se[0]:.12f}, "
-            f"lat {se[1]:.12f}"
+            f"SE = "
+            f"{se[0]:.12f}, "
+            f"{se[1]:.12f}"
         )
 
 
 # ============================================================
-# CLIP
+# CREATE INTERNAL BOUNDARY OVERLAY
 # ============================================================
 
-def clip_to_boundary(
+def create_internal_boundary_overlay(
+    raster_file,
+    boundary,
+    output_png,
+):
+    """
+    Rasterize IRAN.geojson onto the EXACT grid of the FWI raster.
+
+    This is the key diagnostic.
+
+    The boundary is not transformed to another image.
+    It is burned into the exact FWI raster grid.
+    """
+
+    log("")
+    log("=" * 70)
+    log("INTERNAL BOUNDARY OVERLAY")
+    log("=" * 70)
+
+    with rasterio.open(
+        raster_file
+    ) as src:
+
+        raster_width = src.width
+
+        raster_height = src.height
+
+        raster_transform = src.transform
+
+        raster_crs = src.crs
+
+        log(
+            f"Raster CRS: {raster_crs}"
+        )
+
+        log(
+            f"Raster size: "
+            f"{raster_width} x "
+            f"{raster_height}"
+        )
+
+        # ----------------------------------------------------
+        # Reproject boundary to raster CRS
+        # ----------------------------------------------------
+
+        boundary_raster_crs = (
+            boundary.to_crs(
+                raster_crs
+            )
+        )
+
+        # ----------------------------------------------------
+        # Rasterize boundary
+        # ----------------------------------------------------
+
+        shapes = [
+            (
+                geom,
+                1
+            )
+            for geom
+            in boundary_raster_crs.geometry
+            if geom is not None
+        ]
+
+        boundary_mask = rasterize(
+            shapes=shapes,
+            out_shape=(
+                raster_height,
+                raster_width,
+            ),
+            transform=raster_transform,
+            fill=0,
+            all_touched=False,
+            dtype="uint8",
+        )
+
+        # ----------------------------------------------------
+        # Read FWI image
+        # ----------------------------------------------------
+
+        data = src.read()
+
+        if data.shape[0] >= 4:
+
+            rgba = np.moveaxis(
+                data[:4],
+                0,
+                2,
+            ).astype(
+                np.uint8
+            )
+
+        elif data.shape[0] == 3:
+
+            rgb = np.moveaxis(
+                data[:3],
+                0,
+                2,
+            ).astype(
+                np.uint8
+            )
+
+            alpha = np.full(
+                (
+                    raster_height,
+                    raster_width,
+                    1
+                ),
+                255,
+                dtype=np.uint8,
+            )
+
+            rgba = np.concatenate(
+                (
+                    rgb,
+                    alpha
+                ),
+                axis=2,
+            )
+
+        else:
+
+            raise RuntimeError(
+                "Raster has unsupported band count."
+            )
+
+        # ----------------------------------------------------
+        # Create diagnostic image
+        # ----------------------------------------------------
+
+        diagnostic = Image.fromarray(
+            rgba,
+            "RGBA",
+        )
+
+        draw = ImageDraw.Draw(
+            diagnostic
+        )
+
+        # ----------------------------------------------------
+        # Boundary pixels
+        # ----------------------------------------------------
+
+        rows, cols = np.where(
+            boundary_mask == 1
+        )
+
+        log(
+            f"Boundary rasterized pixels: "
+            f"{len(rows)}"
+        )
+
+        if len(rows) == 0:
+
+            raise RuntimeError(
+                "Boundary rasterization produced "
+                "zero pixels."
+            )
+
+        # ----------------------------------------------------
+        # Draw boundary
+        # ----------------------------------------------------
+
+        # We deliberately use a bright white line.
+        #
+        # The diagnostic image is only for testing.
+        # It is not used as the production FWI layer.
+
+        pixel_set = set(
+            zip(
+                cols.tolist(),
+                rows.tolist(),
+            )
+        )
+
+        # Draw each boundary pixel.
+        #
+        # A small 3x3 neighborhood makes the line
+        # visible after GitHub PNG compression/display.
+
+        for x, y in pixel_set:
+
+            for dy in (
+                -1,
+                0,
+                1,
+            ):
+
+                for dx in (
+                    -1,
+                    0,
+                    1,
+                ):
+
+                    xx = x + dx
+                    yy = y + dy
+
+                    if (
+                        0 <= xx < raster_width
+                        and
+                        0 <= yy < raster_height
+                    ):
+
+                        diagnostic.putpixel(
+                            (
+                                xx,
+                                yy
+                            ),
+                            (
+                                255,
+                                255,
+                                255,
+                                255
+                            ),
+                        )
+
+        # ----------------------------------------------------
+        # Draw bounding-box corners
+        # ----------------------------------------------------
+
+        bbox = boundary.total_bounds
+
+        minx, miny, maxx, maxy = (
+            bbox
+        )
+
+        corner_coordinates = [
+            (
+                "NW",
+                minx,
+                maxy,
+            ),
+            (
+                "NE",
+                maxx,
+                maxy,
+            ),
+            (
+                "SW",
+                minx,
+                miny,
+            ),
+            (
+                "SE",
+                maxx,
+                miny,
+            ),
+        ]
+
+        log("")
+        log(
+            "Boundary bbox corner pixels:"
+        )
+
+        for name, lon, lat in (
+            corner_coordinates
+        ):
+
+            col, row = ~raster_transform * (
+                lon,
+                lat,
+            )
+
+            log(
+                f"{name}: "
+                f"lon={lon:.12f}, "
+                f"lat={lat:.12f}, "
+                f"pixel_col={col:.3f}, "
+                f"pixel_row={row:.3f}"
+            )
+
+        # ----------------------------------------------------
+        # Draw small corner markers
+        # ----------------------------------------------------
+
+        for name, lon, lat in (
+            corner_coordinates
+        ):
+
+            col, row = (
+                ~raster_transform
+                * (
+                    lon,
+                    lat,
+                )
+            )
+
+            x = int(
+                round(col)
+            )
+
+            y = int(
+                round(row)
+            )
+
+            radius = 8
+
+            draw.ellipse(
+                (
+                    x - radius,
+                    y - radius,
+                    x + radius,
+                    y + radius,
+                ),
+                outline=(
+                    255,
+                    255,
+                    255,
+                    255
+                ),
+                width=3,
+            )
+
+        # ----------------------------------------------------
+        # Save
+        # ----------------------------------------------------
+
+        diagnostic.save(
+            output_png,
+            format="PNG",
+            optimize=True,
+        )
+
+        log("")
+        log(
+            f"Diagnostic overlay saved:"
+        )
+
+        log(
+            f"  {output_png}"
+        )
+
+        return {
+            "width": raster_width,
+            "height": raster_height,
+            "boundary_pixels": int(
+                len(rows)
+            ),
+        }
+
+
+# ============================================================
+# CLIP TO IRAN
+# ============================================================
+
+def clip_to_iran(
     source_file,
     boundary,
     output_file,
 ):
 
-    geometries = [
-        geom.__geo_interface__
-        for geom in boundary.geometry
-        if geom is not None
-    ]
-
-    if not geometries:
-
-        raise RuntimeError(
-            "No valid geometry found."
-        )
+    log("")
+    log("=" * 70)
+    log("CLIPPING TO IRAN")
+    log("=" * 70)
 
     with rasterio.open(
         source_file
     ) as src:
 
-        boundary_reprojected = (
-            boundary.to_crs(src.crs)
+        boundary_raster_crs = (
+            boundary.to_crs(
+                src.crs
+            )
         )
 
         geometries = [
             geom.__geo_interface__
             for geom
-            in boundary_reprojected.geometry
+            in boundary_raster_crs.geometry
             if geom is not None
         ]
 
@@ -941,17 +1296,25 @@ def clip_to_boundary(
                 clipped
             )
 
+    log(
+        f"Clipped raster:"
+    )
+
+    log(
+        f"  {output_file}"
+    )
+
 
 # ============================================================
-# PNG
+# SAVE FINAL PNG
 # ============================================================
 
-def save_png(
-    clipped_tif
+def save_final_png(
+    clipped_file
 ):
 
     with rasterio.open(
-        clipped_tif
+        clipped_file
     ) as src:
 
         data = src.read()
@@ -959,18 +1322,20 @@ def save_png(
         if data.shape[0] < 4:
 
             raise RuntimeError(
-                "Clipped raster is not RGBA."
+                "Expected RGBA raster."
             )
 
         rgba = np.moveaxis(
             data[:4],
             0,
             2,
+        ).astype(
+            np.uint8
         )
 
         image = Image.fromarray(
-            rgba.astype(np.uint8),
-            "RGBA",
+            rgba,
+            "RGBA"
         )
 
         image.save(
@@ -986,93 +1351,28 @@ def save_png(
         )
 
         return {
-            "west": float(bounds[0]),
-            "south": float(bounds[1]),
-            "east": float(bounds[2]),
-            "north": float(bounds[3]),
-            "width": int(src.width),
-            "height": int(src.height),
-            "crs": str(src.crs),
+            "west": float(
+                bounds[0]
+            ),
+            "south": float(
+                bounds[1]
+            ),
+            "east": float(
+                bounds[2]
+            ),
+            "north": float(
+                bounds[3]
+            ),
+            "width": int(
+                src.width
+            ),
+            "height": int(
+                src.height
+            ),
+            "crs": str(
+                src.crs
+            ),
         }
-
-
-# ============================================================
-# COMPARE
-# ============================================================
-
-def compare_bounds(
-    boundary_bbox,
-    raster_bbox,
-):
-
-    bw, bs, be, bn = boundary_bbox
-
-    rw, rs, re, rn = raster_bbox
-
-    log("")
-    log("=" * 70)
-    log("BOUNDARY vs RASTER")
-    log("=" * 70)
-
-    log(
-        "BOUNDARY:"
-    )
-
-    log(
-        f"  W={bw:.12f}"
-    )
-
-    log(
-        f"  S={bs:.12f}"
-    )
-
-    log(
-        f"  E={be:.12f}"
-    )
-
-    log(
-        f"  N={bn:.12f}"
-    )
-
-    log(
-        "RASTER:"
-    )
-
-    log(
-        f"  W={rw:.12f}"
-    )
-
-    log(
-        f"  S={rs:.12f}"
-    )
-
-    log(
-        f"  E={re:.12f}"
-    )
-
-    log(
-        f"  N={rn:.12f}"
-    )
-
-    log(
-        "DIFFERENCE:"
-    )
-
-    log(
-        f"  west  = {rw - bw:.12f}"
-    )
-
-    log(
-        f"  south = {rs - bs:.12f}"
-    )
-
-    log(
-        f"  east  = {re - be:.12f}"
-    )
-
-    log(
-        f"  north = {rn - bn:.12f}"
-    )
 
 
 # ============================================================
@@ -1083,22 +1383,20 @@ def main():
 
     log("")
     log("=" * 70)
-    log("IR-FWI DIAGNOSTIC BUILD")
+    log("IR-FWI INTERNAL OVERLAY DIAGNOSTIC")
     log("=" * 70)
-
-    WEB_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    log("")
 
     # --------------------------------------------------------
-    # Boundary
+    # Load boundary
     # --------------------------------------------------------
 
     boundary = load_boundary()
 
-    boundary_bbox = boundary_diagnostic(
-        boundary
+    boundary_bbox = (
+        get_boundary_bbox(
+            boundary
+        )
     )
 
     west, south, east, north = (
@@ -1111,7 +1409,8 @@ def main():
 
     log("")
     log(
-        f"FWI date: {FORECAST_DATE}"
+        f"FWI date: "
+        f"{FORECAST_DATE}"
     )
 
     # --------------------------------------------------------
@@ -1137,6 +1436,16 @@ def main():
 
     log(
         f"Tile height: {TILE_HEIGHT}"
+    )
+
+    log(
+        f"Final width: "
+        f"{NX * TILE_WIDTH}"
+    )
+
+    log(
+        f"Final height: "
+        f"{NY * TILE_HEIGHT}"
     )
 
     # --------------------------------------------------------
@@ -1177,29 +1486,32 @@ def main():
                 ) * (y + 1) / NY
             )
 
-            bbox = (
+            requested_bbox = (
                 tile_west,
                 tile_south,
                 tile_east,
                 tile_north,
             )
 
-            name = (
-                f"Tile row={y + 1}/{NY}, "
+            tile_name = (
+                f"Tile "
+                f"row={y + 1}/{NY}, "
                 f"col={x + 1}/{NX}"
             )
 
-            image, actual_bbox = fetch_tile(
-                bbox=bbox,
-                width=TILE_WIDTH,
-                height=TILE_HEIGHT,
-                tile_name=name,
+            image, actual_bbox = (
+                fetch_tile(
+                    bbox=requested_bbox,
+                    width=TILE_WIDTH,
+                    height=TILE_HEIGHT,
+                    tile_name=tile_name,
+                )
             )
 
             image = normalize_tile(
                 image=image,
                 actual_bbox=actual_bbox,
-                requested_bbox=bbox,
+                requested_bbox=requested_bbox,
                 width=TILE_WIDTH,
                 height=TILE_HEIGHT,
             )
@@ -1214,15 +1526,11 @@ def main():
 
     log("")
     log("=" * 70)
-    log("ASSEMBLY")
+    log("ASSEMBLING")
     log("=" * 70)
 
     assembled = assemble_tiles(
-        tiles=tiles,
-        nx=NX,
-        ny=NY,
-        tile_width=TILE_WIDTH,
-        tile_height=TILE_HEIGHT,
+        tiles
     )
 
     assembled_tif = (
@@ -1236,17 +1544,25 @@ def main():
         output_file=assembled_tif,
     )
 
-    log(
-        f"Created: {assembled_tif}"
-    )
-
     raster_diagnostic(
         assembled_tif,
-        "ASSEMBLED BEFORE CLIP"
+        "ASSEMBLED FWI"
     )
 
     # --------------------------------------------------------
-    # Clip
+    # INTERNAL OVERLAY
+    # --------------------------------------------------------
+
+    overlay_info = (
+        create_internal_boundary_overlay(
+            raster_file=assembled_tif,
+            boundary=boundary,
+            output_png=DIAGNOSTIC_FILE,
+        )
+    )
+
+    # --------------------------------------------------------
+    # CLIP
     # --------------------------------------------------------
 
     clipped_tif = (
@@ -1254,79 +1570,25 @@ def main():
         / "fwi_iran_clipped.tif"
     )
 
-    log("")
-    log("=" * 70)
-    log("EXACT IRAN CLIP")
-    log("=" * 70)
-
-    clip_to_boundary(
+    clip_to_iran(
         source_file=assembled_tif,
         boundary=boundary,
         output_file=clipped_tif,
     )
 
-    log(
-        f"Created: {clipped_tif}"
-    )
-
     raster_diagnostic(
         clipped_tif,
-        "AFTER IRAN GEOJSON CLIP"
+        "CLIPPED FWI"
     )
 
     # --------------------------------------------------------
-    # PNG
+    # Final PNG
     # --------------------------------------------------------
 
-    image_info = save_png(
-        clipped_tif
-    )
-
-    log("")
-    log("=" * 70)
-    log("FINAL PNG")
-    log("=" * 70)
-
-    log(
-        f"File: {PNG_FILE}"
-    )
-
-    log(
-        f"Width : {image_info['width']}"
-    )
-
-    log(
-        f"Height: {image_info['height']}"
-    )
-
-    log(
-        f"West  : {image_info['west']:.12f}"
-    )
-
-    log(
-        f"South : {image_info['south']:.12f}"
-    )
-
-    log(
-        f"East  : {image_info['east']:.12f}"
-    )
-
-    log(
-        f"North : {image_info['north']:.12f}"
-    )
-
-    # --------------------------------------------------------
-    # Compare
-    # --------------------------------------------------------
-
-    compare_bounds(
-        boundary_bbox=boundary_bbox,
-        raster_bbox=(
-            image_info["west"],
-            image_info["south"],
-            image_info["east"],
-            image_info["north"],
-        ),
+    image_info = (
+        save_final_png(
+            clipped_tif
+        )
     )
 
     # --------------------------------------------------------
@@ -1349,8 +1611,34 @@ def main():
 
         "image": {
             "file": PNG_FILE.name,
-            "width": image_info["width"],
-            "height": image_info["height"],
+            "width": image_info[
+                "width"
+            ],
+            "height": image_info[
+                "height"
+            ],
+        },
+
+        "diagnostic_overlay": {
+            "file": (
+                DIAGNOSTIC_FILE.name
+            ),
+            "description": (
+                "IRAN.geojson rasterized "
+                "directly onto the assembled "
+                "FWI raster grid"
+            ),
+            "width": overlay_info[
+                "width"
+            ],
+            "height": overlay_info[
+                "height"
+            ],
+            "boundary_pixels": (
+                overlay_info[
+                    "boundary_pixels"
+                ]
+            ),
         },
 
         "wms_bbox": {
@@ -1361,10 +1649,18 @@ def main():
         },
 
         "image_bounds": {
-            "west": image_info["west"],
-            "south": image_info["south"],
-            "east": image_info["east"],
-            "north": image_info["north"],
+            "west": image_info[
+                "west"
+            ],
+            "south": image_info[
+                "south"
+            ],
+            "east": image_info[
+                "east"
+            ],
+            "north": image_info[
+                "north"
+            ],
         },
 
         "iran_boundary": {
@@ -1377,11 +1673,11 @@ def main():
 
         "georeferencing": {
             "method": (
-                "GWIS WMS -> EPSG:4326 "
-                "GeoTIFF -> exact "
-                "IRAN.geojson clip"
+                "WMS tiles -> EPSG:4326 "
+                "GeoTIFF -> internal "
+                "IRAN.geojson raster overlay "
+                "-> exact clip"
             ),
-            "clip": "IRAN.geojson",
             "diagnostic": True,
         },
 
@@ -1413,19 +1709,25 @@ def main():
         )
 
     # --------------------------------------------------------
-    # Final validation
+    # Final checks
     # --------------------------------------------------------
 
     if not PNG_FILE.exists():
 
         raise RuntimeError(
-            "PNG was not created."
+            "Final PNG missing."
         )
 
     if not JSON_FILE.exists():
 
         raise RuntimeError(
-            "JSON was not created."
+            "Final JSON missing."
+        )
+
+    if not DIAGNOSTIC_FILE.exists():
+
+        raise RuntimeError(
+            "Diagnostic overlay missing."
         )
 
     log("")
@@ -1433,27 +1735,47 @@ def main():
     log("DIAGNOSTIC BUILD SUCCESSFUL")
     log("=" * 70)
 
+    log("")
     log(
-        f"PNG : {PNG_FILE}"
+        f"FWI PNG:"
     )
 
     log(
-        f"JSON: {JSON_FILE}"
+        f"  {PNG_FILE}"
+    )
+
+    log(
+        f"Metadata:"
+    )
+
+    log(
+        f"  {JSON_FILE}"
+    )
+
+    log(
+        f"Internal overlay:"
+    )
+
+    log(
+        f"  {DIAGNOSTIC_FILE}"
     )
 
     log("")
     log(
-        "IMPORTANT:"
+        "The diagnostic overlay is the key output."
     )
 
     log(
-        "The next step is to inspect the "
-        "BOUNDARY vs RASTER diagnostic "
-        "and the four raster corners."
+        "It contains the FWI raster and the "
+        "IRAN.geojson boundary on the SAME pixel grid."
     )
 
     log("")
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
