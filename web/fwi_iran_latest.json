@@ -5,8 +5,8 @@
   "crs": "EPSG:4326",
   "image": {
     "file": "fwi_iran_latest.png",
-    "width": 2200,
-    "height": 1600
+    "width": 1600,
+    "height": 1222
   },
   "bbox": {
     "west": 43.85456214904802,
