@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-
 <html lang="fa" dir="rtl">
+
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
 
   <title>سامانه FWI ایران</title>
 
@@ -85,7 +85,6 @@
       color: #ccc;
     }
   </style>
-
 </head>
 
 <body>
@@ -94,61 +93,59 @@
 
   <div class="panel">
 
-```
-<h1>پیش‌بینی شاخص FWI ایران</h1>
+    <h1>پیش‌بینی شاخص FWI ایران</h1>
 
-<div id="date" class="date">
-  در حال بارگذاری...
-</div>
+    <div id="date" class="date">
+      در حال بارگذاری...
+    </div>
 
-<div class="legend">
+    <div class="legend">
 
-  <div>
-    <span
-      class="box"
-      style="background:#00a651"
-    ></span>
-    کم
-  </div>
+      <div>
+        <span
+          class="box"
+          style="background:#00a651"
+        ></span>
+        کم
+      </div>
 
-  <div>
-    <span
-      class="box"
-      style="background:#ffff00"
-    ></span>
-    متوسط
-  </div>
+      <div>
+        <span
+          class="box"
+          style="background:#ffff00"
+        ></span>
+        متوسط
+      </div>
 
-  <div>
-    <span
-      class="box"
-      style="background:#ff9900"
-    ></span>
-    زیاد
-  </div>
+      <div>
+        <span
+          class="box"
+          style="background:#ff9900"
+        ></span>
+        زیاد
+      </div>
 
-  <div>
-    <span
-      class="box"
-      style="background:#ff0000"
-    ></span>
-    خیلی زیاد
-  </div>
+      <div>
+        <span
+          class="box"
+          style="background:#ff0000"
+        ></span>
+        خیلی زیاد
+      </div>
 
-  <div>
-    <span
-      class="box"
-      style="background:#990000"
-    ></span>
-    بحرانی
-  </div>
+      <div>
+        <span
+          class="box"
+          style="background:#990000"
+        ></span>
+        بحرانی
+      </div>
 
-</div>
+    </div>
 
-<div id="status" class="status">
-  در حال دریافت داده...
-</div>
-```
+    <div id="status" class="status">
+      در حال دریافت داده...
+    </div>
 
   </div>
 
@@ -162,11 +159,155 @@
       preferCanvas: true
     });
 
-    /*
-     * نقشه پایه
-     */
     L.tileLayer(
-      "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",       {         maxZoom: 12,         attribution: "© OpenStreetMap contributors"       }     ).addTo(map);       /*      * بارگذاری نقشه      */     async function loadMap() {        /*        * ----------------------------------------------------        * 1. بارگذاری مرز ایران        * ----------------------------------------------------        */        const boundaryResponse =         await fetch(           "IRAN.geojson?ts=" + Date.now()         );        if (!boundaryResponse.ok) {          throw new Error(           "IRAN.geojson پیدا نشد."         );        }        const boundary =         await boundaryResponse.json();         /*        * ----------------------------------------------------        * 2. نمایش مرز ایران        * ----------------------------------------------------        */        const boundaryLayer =         L.geoJSON(           boundary,           {             style: {               color: "#ffffff",               weight: 2,               opacity: 1,               fill: false             }           }         ).addTo(map);         /*        * ----------------------------------------------------        * 3. دریافت Metadata مربوط به FWI        * ----------------------------------------------------        */        const metaResponse =         await fetch(           "fwi_iran_latest.json?ts=" +           Date.now()         );        if (!metaResponse.ok) {          throw new Error(           "فایل FWI هنوز ساخته نشده است."         );        }        const meta =         await metaResponse.json();         /*        * ----------------------------------------------------        * 4. خواندن BBOX        *        * ساختار JSON:        *        * bbox:        *   west        *   south        *   east        *   north        *        * ----------------------------------------------------        */        const b = meta.bbox;        if (         typeof b.west !== "number" ||         typeof b.south !== "number" ||         typeof b.east !== "number" ||         typeof b.north !== "number"       ) {          throw new Error(           "BBOX موجود در fwi_iran_latest.json معتبر نیست."         );        }         /*        * ----------------------------------------------------        * 5. ساخت Bounds صحیح برای Leaflet        *        * اصلاح مهم:        *        * قبلاً:        *        * b[1], b[0]        *        * استفاده شده بود.        *        * اما JSON دارای کلیدهای نام‌دار است.        * ----------------------------------------------------        */        const bounds = [         [b.south, b.west],         [b.north, b.east]       ];         /*        * ----------------------------------------------------        * 6. پیدا کردن نام فایل تصویر        *        * update_fwi.py این ساختار را تولید می‌کند:        *        * image:        *   file        *   width        *   height        *        * ----------------------------------------------------        */        if (         !meta.image ||         !meta.image.file       ) {          throw new Error(           "مسیر تصویر FWI در metadata وجود ندارد."         );        }        const imageUrl =         meta.image.file +         "?ts=" +         Date.now();         /*        * ----------------------------------------------------        * 7. نمایش FWI        * ----------------------------------------------------        */        const fwiLayer =         L.imageOverlay(           imageUrl,           bounds,           {             opacity: 0.72,             interactive: false           }         ).addTo(map);         /*        * ----------------------------------------------------        * 8. قرار دادن مرز روی تصویر        * ----------------------------------------------------        */        boundaryLayer.bringToFront();         /*        * ----------------------------------------------------        * 9. تنظیم نقشه روی ایران        * ----------------------------------------------------        */        map.fitBounds(         boundaryLayer.getBounds(),         {           padding: [10, 10]         }       );         /*        * ----------------------------------------------------        * 10. نمایش تاریخ        * ----------------------------------------------------        */        if (meta.forecast_gregorian) {          document.getElementById("date")           .textContent =           "تاریخ پیش‌بینی: " +           meta.forecast_gregorian;        }       else if (meta.date) {          document.getElementById("date")           .textContent =           "تاریخ پیش‌بینی: " +           meta.date;        }       else {          document.getElementById("date")           .textContent =           "تاریخ پیش‌بینی موجود نیست.";        }         /*        * ----------------------------------------------------        * 11. وضعیت سامانه        * ----------------------------------------------------        */        document.getElementById("status")         .textContent =         "منبع: Copernicus EFFIS / ECMWF GWIS";      }       /*      * ------------------------------------------------------      * اجرای برنامه      * ------------------------------------------------------      */      loadMap()       .catch(function(error) {          console.error(           "IR-FWI error:",           error         );          document.getElementById("date")           .textContent =           "خطا";          document.getElementById("status")           .textContent =           error.message;        });    </script>
+      "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+      {
+        maxZoom: 12,
+        attribution: "&copy; OpenStreetMap contributors"
+      }
+    ).addTo(map);
+
+    async function loadMap() {
+
+      const boundaryResponse =
+        await fetch(
+          "IRAN.geojson?ts=" + Date.now()
+        );
+
+      if (!boundaryResponse.ok) {
+        throw new Error(
+          "IRAN.geojson پیدا نشد."
+        );
+      }
+
+      const boundary =
+        await boundaryResponse.json();
+
+      const boundaryLayer =
+        L.geoJSON(
+          boundary,
+          {
+            style: {
+              color: "#ffffff",
+              weight: 2,
+              opacity: 1,
+              fill: false
+            }
+          }
+        ).addTo(map);
+
+      const metaResponse =
+        await fetch(
+          "fwi_iran_latest.json?ts=" +
+          Date.now()
+        );
+
+      if (!metaResponse.ok) {
+        throw new Error(
+          "فایل FWI هنوز ساخته نشده است."
+        );
+      }
+
+      const meta =
+        await metaResponse.json();
+
+      const b = meta.bbox;
+
+      if (
+        typeof b.west !== "number" ||
+        typeof b.south !== "number" ||
+        typeof b.east !== "number" ||
+        typeof b.north !== "number"
+      ) {
+        throw new Error(
+          "BBOX موجود در fwi_iran_latest.json معتبر نیست."
+        );
+      }
+
+      const bounds = [
+        [b.south, b.west],
+        [b.north, b.east]
+      ];
+
+      if (
+        !meta.image ||
+        !meta.image.file
+      ) {
+        throw new Error(
+          "مسیر تصویر FWI در metadata وجود ندارد."
+        );
+      }
+
+      const imageUrl =
+        meta.image.file +
+        "?ts=" +
+        Date.now();
+
+      L.imageOverlay(
+        imageUrl,
+        bounds,
+        {
+          opacity: 0.72,
+          interactive: false
+        }
+      ).addTo(map);
+
+      boundaryLayer.bringToFront();
+
+      map.fitBounds(
+        boundaryLayer.getBounds(),
+        {
+          padding: [10, 10]
+        }
+      );
+
+      if (meta.forecast_gregorian) {
+
+        document.getElementById("date")
+          .textContent =
+          "تاریخ پیش‌بینی: " +
+          meta.forecast_gregorian;
+
+      } else if (meta.date) {
+
+        document.getElementById("date")
+          .textContent =
+          "تاریخ پیش‌بینی: " +
+          meta.date;
+
+      } else {
+
+        document.getElementById("date")
+          .textContent =
+          "تاریخ پیش‌بینی موجود نیست.";
+
+      }
+
+      document.getElementById("status")
+        .textContent =
+        "منبع: Copernicus EFFIS / ECMWF GWIS";
+    }
+
+    loadMap()
+      .catch(function(error) {
+
+        console.error(
+          "IR-FWI error:",
+          error
+        );
+
+        document.getElementById("date")
+          .textContent =
+          "خطا";
+
+        document.getElementById("status")
+          .textContent =
+          error.message;
+
+      });
+
+  </script>
 
 </body>
+
 </html>
