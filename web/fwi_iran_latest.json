@@ -8,6 +8,13 @@
     "width": 2400,
     "height": 1833
   },
+  "diagnostic_overlay": {
+    "file": "fwi_iran_diagnostic_overlay.png",
+    "description": "IRAN.geojson rasterized directly onto the assembled FWI raster grid",
+    "width": 2400,
+    "height": 1833,
+    "boundary_pixels": 2419505
+  },
   "wms_bbox": {
     "west": 44.047264099121264,
     "south": 25.058748245239258,
@@ -28,8 +35,7 @@
     "file": "IRAN.geojson"
   },
   "georeferencing": {
-    "method": "GWIS WMS -> EPSG:4326 GeoTIFF -> exact IRAN.geojson clip",
-    "clip": "IRAN.geojson",
+    "method": "WMS tiles -> EPSG:4326 GeoTIFF -> internal IRAN.geojson raster overlay -> exact clip",
     "diagnostic": true
   },
   "tile_grid": {
@@ -38,5 +44,5 @@
     "tile_width": 800,
     "tile_height": 611
   },
-  "generated_at_utc": "2026-09-26T18:54:59.941363+00:00"
+  "generated_at_utc": "2026-09-26T19:02:59.456508+00:00"
 }
