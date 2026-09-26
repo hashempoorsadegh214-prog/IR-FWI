@@ -1,18 +1,24 @@
 {
   "source": "Copernicus GWIS / ECMWF",
   "layer": "ecmwf.fwi",
-  "date": "2026-09-27",
+  "date": "2026-09-26",
   "crs": "EPSG:4326",
   "image": {
     "file": "fwi_iran_latest.png",
-    "width": 1600,
-    "height": 1222
+    "width": 2400,
+    "height": 1833
   },
-  "bbox": {
-    "west": 43.85456214904802,
-    "south": 24.911563510894773,
-    "east": 63.51016105651861,
-    "north": 39.9244064140321
+  "wms_bbox": {
+    "west": 44.047264099121264,
+    "south": 25.058748245239258,
+    "east": 63.31745910644537,
+    "north": 39.777221679687614
+  },
+  "image_bounds": {
+    "west": 44.047264099121264,
+    "south": 25.058748245239258,
+    "east": 63.31745910644537,
+    "north": 39.777221679687614
   },
   "iran_boundary": {
     "west": 44.047264099121264,
@@ -22,7 +28,15 @@
     "file": "IRAN.geojson"
   },
   "georeferencing": {
-    "method": "EPSG:4326 georeferenced GeoTIFF followed by geographic mask",
-    "clip": "IRAN.geojson"
-  }
+    "method": "WMS tiles -> EPSG:4326 GeoTIFF -> exact IRAN.geojson mask/crop -> PNG",
+    "clip": "IRAN.geojson",
+    "image_bounds_source": "rasterio.transform.array_bounds"
+  },
+  "tile_grid": {
+    "columns": 3,
+    "rows": 3,
+    "tile_width": 800,
+    "tile_height": 611
+  },
+  "generated_at_utc": "2026-09-26T18:39:32.947954+00:00"
 }
