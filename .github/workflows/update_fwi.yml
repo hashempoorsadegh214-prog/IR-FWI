@@ -34,6 +34,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+
       # ----------------------------------------------------
       # Python
       # ----------------------------------------------------
@@ -42,6 +43,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
 
       # ----------------------------------------------------
       # Dependencies
@@ -52,6 +54,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install requests geopandas shapely pillow pyproj
 
+
       # ----------------------------------------------------
       # Check Iran boundary
       # ----------------------------------------------------
@@ -59,8 +62,22 @@ jobs:
       - name: Check Iran boundary
         run: |
           test -f IRAN.geojson
+
           echo "Iran boundary found:"
           ls -lh IRAN.geojson
+
+
+      # ----------------------------------------------------
+      # Prepare Pages web directory
+      # ----------------------------------------------------
+
+      - name: Copy Iran boundary to web
+        run: |
+          cp IRAN.geojson web/IRAN.geojson
+
+          echo "Boundary copied to web:"
+          ls -lh web/IRAN.geojson
+
 
       # ----------------------------------------------------
       # Build FWI
@@ -70,6 +87,7 @@ jobs:
         run: |
           python scripts/update_fwi.py
 
+
       # ----------------------------------------------------
       # Check generated files
       # ----------------------------------------------------
@@ -77,11 +95,13 @@ jobs:
       - name: Check generated files
         run: |
           test -f web/index.html
+          test -f web/IRAN.geojson
           test -f web/fwi_iran_latest.png
           test -f web/fwi_iran_latest.json
 
-          echo "Generated files:"
+          echo "Generated Pages files:"
           ls -lh web/
+
 
       # ----------------------------------------------------
       # Configure GitHub Pages
@@ -89,6 +109,7 @@ jobs:
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
+
 
       # ----------------------------------------------------
       # Upload Pages artifact
@@ -99,6 +120,7 @@ jobs:
         with:
           path: web
 
+
       # ----------------------------------------------------
       # Deploy
       # ----------------------------------------------------
@@ -106,6 +128,7 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
 
       # ----------------------------------------------------
       # Commit generated FWI
