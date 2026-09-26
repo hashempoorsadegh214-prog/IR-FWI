@@ -20,5 +20,9 @@
     "east": 63.31745910644537,
     "north": 39.777221679687614,
     "file": "IRAN.geojson"
+  },
+  "georeferencing": {
+    "method": "EPSG:4326 georeferenced GeoTIFF followed by geographic mask",
+    "clip": "IRAN.geojson"
   }
 }
