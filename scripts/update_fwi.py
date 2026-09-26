@@ -1,1757 +1,1259 @@
 #!/usr/bin/env python3
 
+"""
+IR-FWI
+Build Iran-wide FWI web product from Copernicus GWIS / ECMWF WMS.
+
+Process:
+1. Read IRAN.geojson
+2. Request ECMWF FWI from GWIS WMS
+3. Download WMS tiles with several fallbacks
+4. Assemble tiles into a georeferenced EPSG:4326 GeoTIFF
+5. Clip exactly to IRAN.geojson
+6. Convert clipped raster to transparent PNG
+7. Calculate exact image bounds from the clipped raster
+8. Write metadata JSON
+"""
+
+from pathlib import Path
 import io
 import json
+import math
 import time
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timezone
+
+import requests
+import numpy as np
+
+from PIL import Image
 
 import geopandas as gpd
-import numpy as np
-import requests
-from PIL import Image
 import rasterio
+from rasterio.io import MemoryFile
 from rasterio.mask import mask
-from rasterio.transform import from_bounds
-from shapely.geometry import mapping
-from shapely.ops import unary_union
+from rasterio.transform import from_bounds, array_bounds
+from rasterio.warp import reproject, Resampling
 
 
 # ============================================================
-# Paths
+# CONFIG
 # ============================================================
 
-ROOT = Path(__file__).resolve().parents[1]
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-BOUNDARY_FILE = ROOT / "IRAN.geojson"
-WEB_DIR = ROOT / "web"
+BOUNDARY_FILE = BASE_DIR / "IRAN.geojson"
 
-OUTPUT_IMAGE = WEB_DIR / "fwi_iran_latest.png"
-OUTPUT_JSON = WEB_DIR / "fwi_iran_latest.json"
-TEMP_GEOTIFF = WEB_DIR / "fwi_iran_working.tif"
+WEB_DIR = BASE_DIR / "web"
 
+PNG_FILE = WEB_DIR / "fwi_iran_latest.png"
+JSON_FILE = WEB_DIR / "fwi_iran_latest.json"
 
-# ============================================================
-# Copernicus GWIS / ECMWF
-# ============================================================
+TMP_DIR = BASE_DIR / "tmp_fwi"
+TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-WMS_URL = (
-    "https://maps.effis.emergency.copernicus.eu/gwis"
-)
+WMS_URL = "https://maps.effis.emergency.copernicus.eu/gwis"
 
 LAYER_NAME = "ecmwf.fwi"
 
+TARGET_CRS = "EPSG:4326"
 
-# ============================================================
-# Main image settings
-# ============================================================
+# Forecast date.
+# The workflow is intended to run daily.
+FORECAST_DATE = (
+    datetime.now(timezone.utc).date()
+)
 
-IMAGE_WIDTH = 1600
+# Number of tiles.
+# 3 x 3 is used to avoid very large WMS requests.
+NX = 3
+NY = 3
 
-# Main WMS grid
-TILES_X = 3
-TILES_Y = 3
+# Main tile pixel size is calculated from geographic dimensions.
+MAX_TILE_WIDTH = 800
+MAX_TILE_HEIGHT = 800
 
+# HTTP settings
+REQUEST_TIMEOUT = 180
 
-# ============================================================
-# Retry settings
-# ============================================================
+MAX_ATTEMPTS_PER_METHOD = 3
 
-MAX_DOWNLOAD_ATTEMPTS = 6
+SLEEP_BETWEEN_ATTEMPTS = 3
 
-RETRY_WAIT_SECONDS = 8
-
-TIMEOUT = 180
-
-
-# ============================================================
-# Fallback tile settings
-# ============================================================
-
-# If a normal 3x3 tile fails, split that tile
-# into this many columns and rows.
-FALLBACK_TILES_X = 2
-FALLBACK_TILES_Y = 2
+# Slight expansion used only when the original WMS BBOX fails.
+# The returned image is subsequently reprojected/cropped back
+# to the exact requested BBOX.
+EXPAND_DEGREES = 0.15
 
 
 # ============================================================
-# HTTP session
+# HTTP SESSION
 # ============================================================
 
 SESSION = requests.Session()
 
 SESSION.headers.update(
     {
-        "User-Agent":
-            "Mozilla/5.0 "
-            "(compatible; IR-FWI/1.0)",
-
-        "Accept":
-            "image/png,image/*;q=0.9,*/*;q=0.8",
-
-        "Accept-Encoding":
-            "identity",
-
-        "Connection":
-            "close",
+        "User-Agent": (
+            "IR-FWI-GitHubActions/1.0 "
+            "(Copernicus GWIS ECMWF FWI)"
+        ),
+        "Accept": (
+            "image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5"
+        ),
+        "Accept-Encoding": "identity",
+        "Connection": "close",
     }
 )
 
 
 # ============================================================
-# Boundary
+# HELPERS
 # ============================================================
 
-def load_iran_boundary():
+def log(message):
+    print(message, flush=True)
+
+
+def validate_image(content):
+    """
+    Validate that HTTP response actually contains a readable image.
+    """
+    if not content:
+        raise ValueError("Empty response")
+
+    if len(content) < 100:
+        raise ValueError(
+            f"Response too small: {len(content)} bytes"
+        )
+
+    try:
+        image = Image.open(io.BytesIO(content))
+        image.load()
+        return image
+    except Exception as exc:
+        raise ValueError(
+            f"Returned content is not a valid image: {exc}"
+        )
+
+
+def get_boundary():
+    """
+    Read Iran boundary and return GeoDataFrame in EPSG:4326.
+    """
 
     if not BOUNDARY_FILE.exists():
-
         raise FileNotFoundError(
-            f"Iran boundary not found: "
-            f"{BOUNDARY_FILE}"
+            f"Boundary file not found: {BOUNDARY_FILE}"
         )
 
-    gdf = gpd.read_file(
-        BOUNDARY_FILE
-    )
+    gdf = gpd.read_file(BOUNDARY_FILE)
 
     if gdf.empty:
-
-        raise RuntimeError(
-            "IRAN.geojson is empty."
-        )
+        raise RuntimeError("Iran boundary is empty.")
 
     if gdf.crs is None:
-
-        gdf = gdf.set_crs(
-            "EPSG:4326"
-        )
-
-    gdf = gdf.to_crs(
-        "EPSG:4326"
-    )
-
-    geometry = unary_union(
-        gdf.geometry
-    )
-
-    if geometry.is_empty:
-
         raise RuntimeError(
-            "Iran boundary geometry is empty."
+            "IRAN.geojson has no CRS."
         )
 
-    return geometry
+    gdf = gdf.to_crs(TARGET_CRS)
+
+    return gdf
 
 
-# ============================================================
-# WMS request bbox
-# ============================================================
+def calculate_bbox(gdf):
+    """
+    Return:
+        west, south, east, north
+    """
 
-def get_bbox(geometry):
-
-    minx, miny, maxx, maxy = (
-        geometry.bounds
-    )
-
-    width = maxx - minx
-    height = maxy - miny
-
-    margin_x = width * 0.01
-    margin_y = height * 0.01
+    minx, miny, maxx, maxy = gdf.total_bounds
 
     return (
-        minx - margin_x,
-        miny - margin_y,
-        maxx + margin_x,
-        maxy + margin_y,
+        float(minx),
+        float(miny),
+        float(maxx),
+        float(maxy),
     )
 
 
-# ============================================================
-# Final image dimensions
-# ============================================================
+def calculate_tile_size(
+    west,
+    south,
+    east,
+    north,
+    nx,
+    ny,
+):
+    """
+    Calculate pixel dimensions while preserving geographic aspect ratio.
+    """
 
-def get_image_dimensions(bbox):
+    tile_width_geo = (east - west) / nx
+    tile_height_geo = (north - south) / ny
 
-    west, south, east, north = bbox
+    ratio = tile_width_geo / tile_height_geo
 
-    geographic_width = (
-        east - west
+    width = MAX_TILE_WIDTH
+    height = max(
+        1,
+        int(round(width / ratio))
     )
 
-    geographic_height = (
-        north - south
-    )
-
-    aspect_ratio = (
-        geographic_width /
-        geographic_height
-    )
-
-    width = IMAGE_WIDTH
-
-    height = round(
-        width / aspect_ratio
-    )
+    if height > MAX_TILE_HEIGHT:
+        height = MAX_TILE_HEIGHT
+        width = max(
+            1,
+            int(round(height * ratio))
+        )
 
     return width, height
 
 
-# ============================================================
-# Main tile geographic extent
-# ============================================================
-
-def get_tile_bbox(
-    bbox,
-    tile_x,
-    tile_y,
-):
-
-    west, south, east, north = bbox
-
-    total_width = east - west
-    total_height = north - south
-
-    tile_width = (
-        total_width /
-        TILES_X
-    )
-
-    tile_height = (
-        total_height /
-        TILES_Y
-    )
-
-    tile_west = (
-        west +
-        tile_x * tile_width
-    )
-
-    tile_east = (
-        west +
-        (tile_x + 1) * tile_width
-    )
-
-    # Row 0 is the northern row.
-    tile_north = (
-        north -
-        tile_y * tile_height
-    )
-
-    tile_south = (
-        north -
-        (tile_y + 1) * tile_height
-    )
-
-    return (
-        tile_west,
-        tile_south,
-        tile_east,
-        tile_north,
-    )
-
-
-# ============================================================
-# Main tile pixel dimensions
-# ============================================================
-
-def get_tile_dimensions(
-    full_width,
-    full_height,
-    tile_x,
-    tile_y,
-):
-
-    base_width = (
-        full_width //
-        TILES_X
-    )
-
-    base_height = (
-        full_height //
-        TILES_Y
-    )
-
-    if tile_x == TILES_X - 1:
-
-        tile_width = (
-            full_width -
-            base_width *
-            (TILES_X - 1)
-        )
-
-    else:
-
-        tile_width = base_width
-
-
-    if tile_y == TILES_Y - 1:
-
-        tile_height = (
-            full_height -
-            base_height *
-            (TILES_Y - 1)
-        )
-
-    else:
-
-        tile_height = base_height
-
-
-    return (
-        tile_width,
-        tile_height,
-    )
-
-
-# ============================================================
-# Download one WMS image
-# ============================================================
-
-def request_wms_image(
+def wms_request(
     bbox,
     width,
     height,
-    target_date,
+    forecast_date,
+    version="1.1.1",
+    image_format="image/png",
+    transparent=True,
 ):
+    """
+    Request one WMS image.
+
+    Returns PIL.Image.
+    """
 
     west, south, east, north = bbox
 
-    params = {
+    if version == "1.1.1":
 
-        "SERVICE":
-            "WMS",
+        params = {
+            "SERVICE": "WMS",
+            "VERSION": "1.1.1",
+            "REQUEST": "GetMap",
+            "LAYERS": LAYER_NAME,
+            "STYLES": "",
+            "FORMAT": image_format,
+            "TRANSPARENT": (
+                "TRUE" if transparent else "FALSE"
+            ),
+            "SRS": "EPSG:4326",
+            "BBOX": (
+                f"{west},{south},{east},{north}"
+            ),
+            "WIDTH": str(width),
+            "HEIGHT": str(height),
+            "TIME": forecast_date.isoformat(),
+        }
 
-        "VERSION":
-            "1.1.1",
+    elif version == "1.3.0":
 
-        "REQUEST":
-            "GetMap",
+        # EPSG:4326 in WMS 1.3.0 uses latitude/longitude
+        # axis order.
+        params = {
+            "SERVICE": "WMS",
+            "VERSION": "1.3.0",
+            "REQUEST": "GetMap",
+            "LAYERS": LAYER_NAME,
+            "STYLES": "",
+            "FORMAT": image_format,
+            "TRANSPARENT": (
+                "TRUE" if transparent else "FALSE"
+            ),
+            "CRS": "EPSG:4326",
+            "BBOX": (
+                f"{south},{west},{north},{east}"
+            ),
+            "WIDTH": str(width),
+            "HEIGHT": str(height),
+            "TIME": forecast_date.isoformat(),
+        }
 
-        "LAYERS":
-            LAYER_NAME,
-
-        "STYLES":
-            "",
-
-        "FORMAT":
-            "image/png",
-
-        "TRANSPARENT":
-            "TRUE",
-
-        "SRS":
-            "EPSG:4326",
-
-        "BBOX":
-            f"{west},{south},{east},{north}",
-
-        "WIDTH":
-            width,
-
-        "HEIGHT":
-            height,
-
-        "TIME":
-            target_date,
-    }
-
+    else:
+        raise ValueError(
+            f"Unsupported WMS version: {version}"
+        )
 
     last_error = None
 
-
     for attempt in range(
         1,
-        MAX_DOWNLOAD_ATTEMPTS + 1
+        MAX_ATTEMPTS_PER_METHOD + 1
     ):
-
-        response = None
 
         try:
 
-            print(
-                f"Downloading WMS "
-                f"{width}x{height} "
-                f"attempt "
-                f"{attempt}/"
-                f"{MAX_DOWNLOAD_ATTEMPTS}"
+            log(
+                f"      HTTP attempt "
+                f"{attempt}/{MAX_ATTEMPTS_PER_METHOD} "
+                f"version={version} "
+                f"format={image_format}"
             )
 
-
             response = SESSION.get(
-
                 WMS_URL,
-
                 params=params,
-
-                timeout=TIMEOUT,
-
+                timeout=REQUEST_TIMEOUT,
                 stream=True,
             )
 
-
             response.raise_for_status()
 
+            content = response.content
 
-            expected_length = (
-                response.headers.get(
-                    "Content-Length"
-                )
+            image = validate_image(content)
+
+            log(
+                f"      OK "
+                f"{len(content)} bytes "
+                f"{image.width}x{image.height}"
             )
-
-
-            data = bytearray()
-
-
-            for chunk in response.iter_content(
-                chunk_size=16384
-            ):
-
-                if chunk:
-
-                    data.extend(
-                        chunk
-                    )
-
-
-            if not data:
-
-                raise RuntimeError(
-                    "WMS returned "
-                    "an empty response."
-                )
-
-
-            if expected_length:
-
-                expected = int(
-                    expected_length
-                )
-
-                received = len(data)
-
-                print(
-                    f"Received "
-                    f"{received} / "
-                    f"{expected} bytes"
-                )
-
-                if received != expected:
-
-                    raise RuntimeError(
-                        "Incomplete WMS response: "
-                        f"{received} / "
-                        f"{expected} bytes"
-                    )
-
-
-            image = Image.open(
-                io.BytesIO(
-                    bytes(data)
-                )
-            ).convert(
-                "RGBA"
-            )
-
-
-            if image.size != (
-                width,
-                height
-            ):
-
-                raise RuntimeError(
-                    "Unexpected WMS image size: "
-                    f"{image.size}; "
-                    f"expected "
-                    f"{(width, height)}"
-                )
-
-
-            print(
-                "Tile downloaded successfully."
-            )
-
 
             return image
-
 
         except Exception as exc:
 
             last_error = exc
 
-            print(
-                "WMS request failed:"
+            log(
+                f"      FAILED: {repr(exc)}"
             )
 
-            print(
-                repr(exc)
-            )
+            try:
+                response.close()
+            except Exception:
+                pass
 
-
-            if attempt < (
-                MAX_DOWNLOAD_ATTEMPTS
-            ):
-
-                wait_time = (
-                    RETRY_WAIT_SECONDS *
-                    attempt
-                )
-
-                print(
-                    f"Waiting "
-                    f"{wait_time} seconds..."
-                )
-
+            if attempt < MAX_ATTEMPTS_PER_METHOD:
                 time.sleep(
-                    wait_time
+                    SLEEP_BETWEEN_ATTEMPTS
                 )
-
-
-        finally:
-
-            if response is not None:
-
-                try:
-
-                    response.close()
-
-                except Exception:
-
-                    pass
-
 
     raise RuntimeError(
-
-        "WMS request failed after "
-        f"{MAX_DOWNLOAD_ATTEMPTS} "
-        f"attempts: "
-        f"{last_error}"
-
+        f"WMS request failed: {last_error}"
     )
 
 
-# ============================================================
-# Download normal tile
-# ============================================================
+def image_to_rgba_array(image):
+    """
+    Convert PIL image to RGBA numpy array.
+    """
 
-def download_normal_tile(
+    return np.asarray(
+        image.convert("RGBA"),
+        dtype=np.uint8,
+    )
+
+
+def fetch_tile(
     bbox,
     width,
     height,
-    target_date,
+    forecast_date,
+    tile_name,
 ):
+    """
+    Download one tile using multiple fallback methods.
 
-    return request_wms_image(
-
-        bbox,
-
-        width,
-
-        height,
-
-        target_date,
-
-    )
-
-
-# ============================================================
-# Create fallback sub-tile bbox
-# ============================================================
-
-def get_fallback_bbox(
-    bbox,
-    sub_x,
-    sub_y,
-):
+    Returns:
+        PIL.Image
+        actual_bbox_used
+    """
 
     west, south, east, north = bbox
 
-    total_width = (
-        east - west
+    log("")
+    log(
+        f"  {tile_name}"
+    )
+    log(
+        f"    BBOX = "
+        f"({west}, {south}, {east}, {north})"
+    )
+    log(
+        f"    SIZE = "
+        f"{width} x {height}"
     )
 
-    total_height = (
-        north - south
-    )
+    # --------------------------------------------------------
+    # METHOD 1
+    # WMS 1.1.1 PNG
+    # --------------------------------------------------------
 
-    sub_width = (
-        total_width /
-        FALLBACK_TILES_X
-    )
+    methods = [
+        {
+            "name": "WMS 1.1.1 PNG",
+            "version": "1.1.1",
+            "format": "image/png",
+            "transparent": True,
+        },
+        {
+            "name": "WMS 1.1.1 JPEG",
+            "version": "1.1.1",
+            "format": "image/jpeg",
+            "transparent": False,
+        },
+        {
+            "name": "WMS 1.3.0 PNG",
+            "version": "1.3.0",
+            "format": "image/png",
+            "transparent": True,
+        },
+    ]
 
-    sub_height = (
-        total_height /
-        FALLBACK_TILES_Y
-    )
+    for method in methods:
 
-
-    sub_west = (
-        west +
-        sub_x * sub_width
-    )
-
-    sub_east = (
-        west +
-        (sub_x + 1) *
-        sub_width
-    )
-
-
-    # Row 0 = north
-    sub_north = (
-        north -
-        sub_y * sub_height
-    )
-
-    sub_south = (
-        north -
-        (sub_y + 1) *
-        sub_height
-    )
-
-
-    return (
-        sub_west,
-        sub_south,
-        sub_east,
-        sub_north,
-    )
-
-
-# ============================================================
-# Download fallback tile
-# ============================================================
-
-def download_fallback_tile(
-    bbox,
-    width,
-    height,
-    target_date,
-):
-
-    print(
-        "================================================"
-    )
-
-    print(
-        "FALLBACK MODE"
-    )
-
-    print(
-        "Splitting failed tile into "
-        f"{FALLBACK_TILES_X}x"
-        f"{FALLBACK_TILES_Y} sub-tiles."
-    )
-
-
-    canvas = Image.new(
-
-        "RGBA",
-
-        (
-            width,
-            height
-        ),
-
-        (
-            0,
-            0,
-            0,
-            0
+        log(
+            f"    Trying {method['name']}"
         )
-    )
-
-
-    base_width = (
-        width //
-        FALLBACK_TILES_X
-    )
-
-    base_height = (
-        height //
-        FALLBACK_TILES_Y
-    )
-
-
-    for sub_y in range(
-        FALLBACK_TILES_Y
-    ):
-
-        for sub_x in range(
-            FALLBACK_TILES_X
-        ):
-
-            if sub_x == (
-                FALLBACK_TILES_X - 1
-            ):
-
-                sub_width = (
-                    width -
-                    base_width *
-                    (
-                        FALLBACK_TILES_X - 1
-                    )
-                )
-
-            else:
-
-                sub_width = base_width
-
-
-            if sub_y == (
-                FALLBACK_TILES_Y - 1
-            ):
-
-                sub_height = (
-                    height -
-                    base_height *
-                    (
-                        FALLBACK_TILES_Y - 1
-                    )
-                )
-
-            else:
-
-                sub_height = base_height
-
-
-            sub_bbox = get_fallback_bbox(
-
-                bbox,
-
-                sub_x,
-
-                sub_y,
-
-            )
-
-
-            print(
-                "Fallback sub-tile:"
-            )
-
-            print(
-                f"{sub_y + 1}/"
-                f"{FALLBACK_TILES_Y}, "
-                f"{sub_x + 1}/"
-                f"{FALLBACK_TILES_X}"
-            )
-
-            print(
-                "BBox:",
-                sub_bbox
-            )
-
-            print(
-                "Size:",
-                sub_width,
-                sub_height
-            )
-
-
-            sub_image = request_wms_image(
-
-                sub_bbox,
-
-                sub_width,
-
-                sub_height,
-
-                target_date,
-
-            )
-
-
-            pixel_x = (
-                sub_x *
-                base_width
-            )
-
-            pixel_y = (
-                sub_y *
-                base_height
-            )
-
-
-            canvas.paste(
-
-                sub_image,
-
-                (
-                    pixel_x,
-                    pixel_y
-                )
-            )
-
-
-    print(
-        "Fallback tile assembled successfully."
-    )
-
-
-    return canvas
-
-
-# ============================================================
-# Download one tile with fallback
-# ============================================================
-
-def download_tile_with_fallback(
-    bbox,
-    width,
-    height,
-    target_date,
-):
-
-    try:
-
-        return download_normal_tile(
-
-            bbox,
-
-            width,
-
-            height,
-
-            target_date,
-
-        )
-
-    except Exception as primary_error:
-
-        print(
-            "------------------------------------------------"
-        )
-
-        print(
-            "NORMAL TILE FAILED."
-        )
-
-        print(
-            "Switching to fallback mode."
-        )
-
-        print(
-            "Original error:"
-        )
-
-        print(
-            repr(primary_error)
-        )
-
 
         try:
 
-            return download_fallback_tile(
-
-                bbox,
-
-                width,
-
-                height,
-
-                target_date,
-
+            image = wms_request(
+                bbox=bbox,
+                width=width,
+                height=height,
+                forecast_date=forecast_date,
+                version=method["version"],
+                image_format=method["format"],
+                transparent=method["transparent"],
             )
 
-        except Exception as fallback_error:
+            return image.convert("RGBA"), bbox
 
-            raise RuntimeError(
+        except Exception as exc:
 
-                "Both normal tile and "
-                "fallback sub-tiles failed.\n"
-                f"Normal error: "
-                f"{primary_error}\n"
-                f"Fallback error: "
-                f"{fallback_error}"
+            log(
+                f"    {method['name']} failed:"
+            )
+            log(
+                f"      {repr(exc)}"
+            )
 
-            ) from fallback_error
+    # --------------------------------------------------------
+    # METHOD 4
+    # EXPANDED BBOX
+    # --------------------------------------------------------
+
+    log("")
+    log(
+        "    Original BBOX failed."
+    )
+    log(
+        "    Trying expanded BBOX fallback..."
+    )
+
+    expanded_bbox = (
+        west - EXPAND_DEGREES,
+        south - EXPAND_DEGREES,
+        east + EXPAND_DEGREES,
+        north + EXPAND_DEGREES,
+    )
+
+    expanded_width = width + 40
+    expanded_height = height + 40
+
+    try:
+
+        image = wms_request(
+            bbox=expanded_bbox,
+            width=expanded_width,
+            height=expanded_height,
+            forecast_date=forecast_date,
+            version="1.1.1",
+            image_format="image/jpeg",
+            transparent=False,
+        )
+
+        log(
+            "    Expanded BBOX succeeded."
+        )
+
+        return (
+            image.convert("RGBA"),
+            expanded_bbox,
+        )
+
+    except Exception as exc:
+
+        log(
+            "    Expanded BBOX failed:"
+        )
+        log(
+            f"      {repr(exc)}"
+        )
+
+    raise RuntimeError(
+        f"All WMS fallback methods failed for {tile_name}"
+    )
 
 
-# ============================================================
-# Download and assemble complete image
-# ============================================================
-
-def download_fwi(
-    bbox,
+def normalize_tile_to_requested_bbox(
+    image,
+    actual_bbox,
+    requested_bbox,
     width,
     height,
-    target_date,
 ):
+    """
+    If the server returned an expanded BBOX, resample it
+    back to the exact requested BBOX.
 
-    print(
-        "WMS request bbox:"
+    If actual_bbox == requested_bbox, simply resize if needed.
+    """
+
+    actual_west, actual_south, actual_east, actual_north = (
+        actual_bbox
     )
 
-    print(
-        bbox
+    req_west, req_south, req_east, req_north = (
+        requested_bbox
     )
 
+    source = image.convert("RGBA")
 
-    print(
-        "Final image size:"
-    )
-
-    print(
-        width,
-        height
-    )
-
-
-    canvas = Image.new(
-
-        "RGBA",
-
-        (
-            width,
-            height
-        ),
-
-        (
-            0,
-            0,
-            0,
-            0
-        )
-    )
-
-
-    for tile_y in range(
-        TILES_Y
+    # Exact BBOX.
+    if (
+        abs(actual_west - req_west) < 1e-12
+        and abs(actual_south - req_south) < 1e-12
+        and abs(actual_east - req_east) < 1e-12
+        and abs(actual_north - req_north) < 1e-12
     ):
 
-        for tile_x in range(
-            TILES_X
-        ):
-
-            print(
-                "------------------------------------------------"
+        if source.size != (width, height):
+            source = source.resize(
+                (width, height),
+                Image.Resampling.BILINEAR,
             )
 
-            print(
-                f"Tile "
-                f"{tile_y + 1}/"
-                f"{TILES_Y}, "
-                f"{tile_x + 1}/"
-                f"{TILES_X}"
-            )
+        return source
 
+    # --------------------------------------------------------
+    # Expanded BBOX:
+    # georeference source then warp to exact target.
+    # --------------------------------------------------------
 
-            tile_bbox = get_tile_bbox(
-
-                bbox,
-
-                tile_x,
-
-                tile_y,
-
-            )
-
-
-            tile_width, tile_height = (
-                get_tile_dimensions(
-
-                    width,
-
-                    height,
-
-                    tile_x,
-
-                    tile_y,
-
-                )
-            )
-
-
-            print(
-                "Tile bbox:"
-            )
-
-            print(
-                tile_bbox
-            )
-
-
-            print(
-                "Tile size:"
-            )
-
-            print(
-                tile_width,
-                tile_height
-            )
-
-
-            tile = download_tile_with_fallback(
-
-                tile_bbox,
-
-                tile_width,
-
-                tile_height,
-
-                target_date,
-
-            )
-
-
-            # --------------------------------------------
-            # Pixel placement
-            # --------------------------------------------
-
-            pixel_x = 0
-
-            for previous_x in range(
-                tile_x
-            ):
-
-                previous_width, _ = (
-                    get_tile_dimensions(
-
-                        width,
-
-                        height,
-
-                        previous_x,
-
-                        tile_y,
-
-                    )
-                )
-
-                pixel_x += (
-                    previous_width
-                )
-
-
-            pixel_y = 0
-
-            for previous_y in range(
-                tile_y
-            ):
-
-                _, previous_height = (
-                    get_tile_dimensions(
-
-                        width,
-
-                        height,
-
-                        tile_x,
-
-                        previous_y,
-
-                    )
-                )
-
-                pixel_y += (
-                    previous_height
-                )
-
-
-            canvas.paste(
-
-                tile,
-
-                (
-                    pixel_x,
-                    pixel_y
-                )
-
-            )
-
-
-            print(
-                "Tile placed at:"
-            )
-
-            print(
-                pixel_x,
-                pixel_y
-            )
-
-
-    print(
-        "================================================"
+    src_array = np.asarray(
+        source,
+        dtype=np.uint8,
     )
 
-    print(
-        "All WMS tiles assembled successfully."
+    src_height, src_width = (
+        src_array.shape[0],
+        src_array.shape[1],
     )
 
-    print(
-        "================================================"
+    src_transform = from_bounds(
+        actual_west,
+        actual_south,
+        actual_east,
+        actual_north,
+        src_width,
+        src_height,
+    )
+
+    dst_transform = from_bounds(
+        req_west,
+        req_south,
+        req_east,
+        req_north,
+        width,
+        height,
+    )
+
+    dst_array = np.zeros(
+        (4, height, width),
+        dtype=np.uint8,
+    )
+
+    for band in range(4):
+
+        reproject(
+            source=src_array[:, :, band],
+            destination=dst_array[band],
+            src_transform=src_transform,
+            src_crs=TARGET_CRS,
+            dst_transform=dst_transform,
+            dst_crs=TARGET_CRS,
+            resampling=Resampling.bilinear,
+        )
+
+    output = np.moveaxis(
+        dst_array,
+        0,
+        2,
+    )
+
+    return Image.fromarray(
+        output,
+        mode="RGBA",
     )
 
 
-    return canvas
+def assemble_tiles(
+    tile_images,
+    tile_bboxes,
+    full_bbox,
+    nx,
+    ny,
+):
+    """
+    Assemble downloaded tiles into one RGBA image.
+    """
+
+    west, south, east, north = full_bbox
+
+    full_width = sum(
+        tile_images[(0, x)].width
+        for x in range(nx)
+    )
+
+    full_height = sum(
+        tile_images[(y, 0)].height
+        for y in range(ny)
+    )
+
+    canvas = Image.new(
+        "RGBA",
+        (full_width, full_height),
+        (0, 0, 0, 0),
+    )
+
+    # All tiles have identical dimensions.
+    tile_width = tile_images[(0, 0)].width
+    tile_height = tile_images[(0, 0)].height
+
+    for y in range(ny):
+
+        for x in range(nx):
+
+            image = tile_images[(y, x)]
+
+            px = x * tile_width
+            py = y * tile_height
+
+            canvas.alpha_composite(
+                image,
+                (px, py),
+            )
+
+    return canvas, full_width, full_height
 
 
-# ============================================================
-# Create georeferenced GeoTIFF
-# ============================================================
-
-def create_georeferenced_geotiff(
+def save_geotiff(
     image,
     bbox,
+    output_file,
 ):
+    """
+    Save RGBA image as EPSG:4326 GeoTIFF.
+    """
 
     west, south, east, north = bbox
 
-    width, height = (
-        image.size
+    rgba = np.asarray(
+        image.convert("RGBA"),
+        dtype=np.uint8,
     )
 
+    height, width, _ = rgba.shape
 
     transform = from_bounds(
-
         west,
-
         south,
-
         east,
-
         north,
-
         width,
-
         height,
-
     )
 
-
-    rgba = np.asarray(
-
-        image,
-
-        dtype=np.uint8
-
-    )
-
+    profile = {
+        "driver": "GTiff",
+        "height": height,
+        "width": width,
+        "count": 4,
+        "dtype": "uint8",
+        "crs": TARGET_CRS,
+        "transform": transform,
+        "compress": "deflate",
+        "predictor": 2,
+    }
 
     with rasterio.open(
-
-        TEMP_GEOTIFF,
-
+        output_file,
         "w",
+        **profile,
+    ) as dst:
 
+        for i in range(4):
+
+            dst.write(
+                rgba[:, :, i + 0],
+                i + 1,
+            )
+
+
+def create_geotiff_from_image(
+    image,
+    bbox,
+    output_file,
+):
+    """
+    Correctly save image bands to GeoTIFF.
+    """
+
+    west, south, east, north = bbox
+
+    rgba = np.asarray(
+        image.convert("RGBA"),
+        dtype=np.uint8,
+    )
+
+    height = rgba.shape[0]
+    width = rgba.shape[1]
+
+    transform = from_bounds(
+        west,
+        south,
+        east,
+        north,
+        width,
+        height,
+    )
+
+    with rasterio.open(
+        output_file,
+        "w",
         driver="GTiff",
-
         width=width,
-
         height=height,
-
         count=4,
-
         dtype="uint8",
-
-        crs="EPSG:4326",
-
+        crs=TARGET_CRS,
         transform=transform,
-
-        nodata=0,
-
         compress="deflate",
-
     ) as dst:
 
         for band in range(4):
 
             dst.write(
-
-                rgba[:, :, band],
-
-                band + 1
-
+                rgba[:, :, band + 0],
+                band + 1,
             )
 
 
-    print(
-        "Georeferenced GeoTIFF created:"
-    )
-
-    print(
-        TEMP_GEOTIFF
-    )
-
-
-# ============================================================
-# Clip exactly to Iran boundary
-# ============================================================
-
-def clip_geotiff_to_iran(
-    geometry
+def clip_to_iran(
+    source_tif,
+    boundary_gdf,
+    clipped_tif,
 ):
+    """
+    Clip raster exactly to Iran boundary.
+    """
 
-    with rasterio.open(
-        TEMP_GEOTIFF
-    ) as src:
+    geometries = [
+        geom.__geo_interface__
+        for geom in boundary_gdf.geometry
+        if geom is not None
+    ]
 
-        clipped, clipped_transform = (
-            mask(
+    if not geometries:
+        raise RuntimeError(
+            "No valid Iran geometry found."
+        )
 
-                src,
+    with rasterio.open(source_tif) as src:
 
-                [mapping(geometry)],
-
-                crop=True,
-
-                filled=True,
-
-                nodata=0,
-
+        if src.crs is None:
+            raise RuntimeError(
+                "Source raster has no CRS."
             )
+
+        boundary = boundary_gdf.to_crs(
+            src.crs
         )
 
+        geometry_list = [
+            geom.__geo_interface__
+            for geom in boundary.geometry
+            if geom is not None
+        ]
 
-        clipped_height = (
-            clipped.shape[1]
+        clipped, clipped_transform = mask(
+            src,
+            geometry_list,
+            crop=True,
+            filled=True,
+            nodata=0,
         )
 
-        clipped_width = (
-            clipped.shape[2]
-        )
-
-
-        profile = (
-            src.profile.copy()
-        )
-
+        profile = src.profile.copy()
 
         profile.update(
-
             {
-
-                "height":
-                    clipped_height,
-
-                "width":
-                    clipped_width,
-
-                "transform":
-                    clipped_transform,
-
-                "nodata":
-                    0,
-
-                "compress":
-                    "deflate",
-
+                "height": clipped.shape[1],
+                "width": clipped.shape[2],
+                "transform": clipped_transform,
+                "compress": "deflate",
             }
-
         )
 
+        with rasterio.open(
+            clipped_tif,
+            "w",
+            **profile,
+        ) as dst:
 
-        image_bounds = (
-            rasterio.transform.array_bounds(
+            dst.write(clipped)
 
-                clipped_height,
-
-                clipped_width,
-
-                clipped_transform,
-
-            )
-        )
+    return clipped_transform
 
 
-        print(
-            "================================================"
-        )
-
-        print(
-            "Clipped raster bounds:"
-        )
-
-        print(
-            image_bounds
-        )
-
-
-        print(
-            "Clipped raster size:"
-        )
-
-        print(
-            clipped_width,
-            clipped_height
-        )
-
-
-        return (
-
-            clipped,
-
-            profile,
-
-            image_bounds,
-
-        )
-
-
-# ============================================================
-# Save PNG
-# ============================================================
-
-def save_web_png(
-    clipped,
-    profile,
+def save_png_from_clipped(
+    clipped_tif,
 ):
+    """
+    Convert clipped RGBA GeoTIFF to PNG.
+    """
 
-    rgba = np.transpose(
+    with rasterio.open(clipped_tif) as src:
 
-        clipped,
+        data = src.read()
 
-        (
-            1,
+        if data.shape[0] < 4:
+            raise RuntimeError(
+                "Expected 4-band RGBA raster."
+            )
+
+        rgba = np.moveaxis(
+            data[:4],
+            0,
             2,
-            0
         )
 
-    )
+        image = Image.fromarray(
+            rgba.astype(np.uint8),
+            mode="RGBA",
+        )
 
+        image.save(
+            PNG_FILE,
+            format="PNG",
+            optimize=True,
+        )
 
-    rgba = np.asarray(
+        bounds = array_bounds(
+            src.height,
+            src.width,
+            src.transform,
+        )
 
-        rgba,
+        west = float(bounds[0])
+        south = float(bounds[1])
+        east = float(bounds[2])
+        north = float(bounds[3])
 
-        dtype=np.uint8
-
-    )
-
-
-    image = Image.fromarray(
-
-        rgba,
-
-        mode="RGBA"
-
-    )
-
-
-    image.save(
-
-        OUTPUT_IMAGE,
-
-        format="PNG",
-
-        optimize=True
-
-    )
-
-
-    print(
-        "Web PNG created:"
-    )
-
-    print(
-        OUTPUT_IMAGE
-    )
-
-
-    return (
-
-        image.width,
-
-        image.height,
-
-    )
+        return {
+            "west": west,
+            "south": south,
+            "east": east,
+            "north": north,
+            "width": int(src.width),
+            "height": int(src.height),
+            "crs": str(src.crs),
+        }
 
 
 # ============================================================
-# Main
+# MAIN
 # ============================================================
 
 def main():
 
+    log("")
+    log("=" * 70)
+    log("IR-FWI - Iran ECMWF FWI Builder")
+    log("=" * 70)
+    log("")
+
     WEB_DIR.mkdir(
-
         parents=True,
-
-        exist_ok=True
-
+        exist_ok=True,
     )
-
-
-    print(
-        "============================================================"
-    )
-
-    print(
-        "IR-FWI UPDATE"
-    )
-
-    print(
-        "============================================================"
-    )
-
 
     # --------------------------------------------------------
-    # Load Iran boundary
+    # Boundary
     # --------------------------------------------------------
 
-    iran_geometry = (
-        load_iran_boundary()
+    log("Loading Iran boundary...")
+
+    boundary = get_boundary()
+
+    west, south, east, north = calculate_bbox(
+        boundary
     )
 
-
-    (
-        iran_west,
-        iran_south,
-        iran_east,
-        iran_north,
-    ) = iran_geometry.bounds
-
-
-    print(
-        "Iran boundary:"
+    log(
+        f"Iran boundary:"
     )
 
-    print(
-
-        iran_west,
-
-        iran_south,
-
-        iran_east,
-
-        iran_north
-
+    log(
+        f"  west  = {west}"
     )
 
+    log(
+        f"  south = {south}"
+    )
+
+    log(
+        f"  east  = {east}"
+    )
+
+    log(
+        f"  north = {north}"
+    )
 
     # --------------------------------------------------------
-    # WMS bbox
+    # Date
     # --------------------------------------------------------
 
-    wms_bbox = get_bbox(
-
-        iran_geometry
-
+    log("")
+    log(
+        f"FWI date: {FORECAST_DATE}"
     )
-
-
-    print(
-        "WMS bbox:"
-    )
-
-    print(
-        wms_bbox
-    )
-
 
     # --------------------------------------------------------
-    # Forecast date
+    # Tiles
     # --------------------------------------------------------
 
-    now_utc = datetime.now(
-        timezone.utc
+    tile_width, tile_height = calculate_tile_size(
+        west,
+        south,
+        east,
+        north,
+        NX,
+        NY,
     )
 
-
-    target_date = (
-
-        now_utc +
-
-        timedelta(days=1)
-
-    ).strftime(
-        "%Y-%m-%d"
+    log("")
+    log(
+        f"Tile grid: {NX} x {NY}"
     )
 
-
-    print(
-        "Target FWI date:",
-        target_date
+    log(
+        f"Tile size: {tile_width} x {tile_height}"
     )
 
+    # --------------------------------------------------------
+    # Download tiles
+    # --------------------------------------------------------
+
+    tile_images = {}
+    tile_bboxes = {}
+
+    for y in range(NY):
+
+        for x in range(NX):
+
+            tile_west = (
+                west
+                + (east - west) * x / NX
+            )
+
+            tile_east = (
+                west
+                + (east - west) * (x + 1) / NX
+            )
+
+            # y=0 is north tile.
+            tile_north = (
+                north
+                - (north - south) * y / NY
+            )
+
+            tile_south = (
+                north
+                - (north - south) * (y + 1) / NY
+            )
+
+            requested_bbox = (
+                tile_west,
+                tile_south,
+                tile_east,
+                tile_north,
+            )
+
+            tile_name = (
+                f"Tile {y + 1}/{NY}, "
+                f"column {x + 1}/{NX}"
+            )
+
+            image, actual_bbox = fetch_tile(
+                bbox=requested_bbox,
+                width=tile_width,
+                height=tile_height,
+                forecast_date=FORECAST_DATE,
+                tile_name=tile_name,
+            )
+
+            image = normalize_tile_to_requested_bbox(
+                image=image,
+                actual_bbox=actual_bbox,
+                requested_bbox=requested_bbox,
+                width=tile_width,
+                height=tile_height,
+            )
+
+            tile_images[(y, x)] = image
+            tile_bboxes[(y, x)] = requested_bbox
 
     # --------------------------------------------------------
-    # Final image dimensions
+    # Assemble
     # --------------------------------------------------------
 
-    width, height = (
-        get_image_dimensions(
+    log("")
+    log("=" * 70)
+    log("Assembling WMS tiles...")
+    log("=" * 70)
 
-            wms_bbox
-
-        )
+    full_image, full_width, full_height = assemble_tiles(
+        tile_images=tile_images,
+        tile_bboxes=tile_bboxes,
+        full_bbox=(
+            west,
+            south,
+            east,
+            north,
+        ),
+        nx=NX,
+        ny=NY,
     )
 
-
-    geographic_aspect = (
-
-        (
-            wms_bbox[2] -
-            wms_bbox[0]
-        )
-
-        /
-
-        (
-            wms_bbox[3] -
-            wms_bbox[1]
-        )
-
+    log(
+        f"Assembled image: "
+        f"{full_width} x {full_height}"
     )
 
+    # --------------------------------------------------------
+    # Temporary GeoTIFF
+    # --------------------------------------------------------
 
-    image_aspect = (
-        width / height
+    assembled_tif = (
+        TMP_DIR / "fwi_iran_assembled.tif"
     )
 
-
-    print(
-        "Geographic aspect ratio:",
-        geographic_aspect
+    log("")
+    log(
+        "Writing georeferenced GeoTIFF..."
     )
 
-
-    print(
-        "Image aspect ratio:",
-        image_aspect
+    create_geotiff_from_image(
+        image=full_image,
+        bbox=(
+            west,
+            south,
+            east,
+            north,
+        ),
+        output_file=assembled_tif,
     )
 
-
-    # --------------------------------------------------------
-    # Download FWI
-    # --------------------------------------------------------
-
-    image = download_fwi(
-
-        wms_bbox,
-
-        width,
-
-        height,
-
-        target_date,
-
+    log(
+        f"Created: {assembled_tif}"
     )
 
-
     # --------------------------------------------------------
-    # Create georeferenced GeoTIFF
+    # Exact Iran clip
     # --------------------------------------------------------
 
-    create_georeferenced_geotiff(
-
-        image,
-
-        wms_bbox,
-
+    clipped_tif = (
+        TMP_DIR / "fwi_iran_clipped.tif"
     )
 
+    log("")
+    log("=" * 70)
+    log("Clipping raster to IRAN.geojson...")
+    log("=" * 70)
 
-    # --------------------------------------------------------
-    # Clip exactly to Iran
-    # --------------------------------------------------------
-
-    (
-        clipped,
-
-        profile,
-
-        image_bounds,
-
-    ) = clip_geotiff_to_iran(
-
-        iran_geometry
-
+    clip_to_iran(
+        source_tif=assembled_tif,
+        boundary_gdf=boundary,
+        clipped_tif=clipped_tif,
     )
 
-
-    # --------------------------------------------------------
-    # Save PNG
-    # --------------------------------------------------------
-
-    (
-        clipped_width,
-        clipped_height,
-
-    ) = save_web_png(
-
-        clipped,
-
-        profile,
-
+    log(
+        f"Clipped raster: {clipped_tif}"
     )
 
-
     # --------------------------------------------------------
-    # Remove temporary GeoTIFF
+    # PNG
     # --------------------------------------------------------
 
-    if TEMP_GEOTIFF.exists():
+    log("")
+    log(
+        "Creating final PNG..."
+    )
 
-        TEMP_GEOTIFF.unlink()
+    image_info = save_png_from_clipped(
+        clipped_tif
+    )
 
+    log(
+        f"Final PNG: {PNG_FILE}"
+    )
+
+    log(
+        f"Final image size: "
+        f"{image_info['width']} x "
+        f"{image_info['height']}"
+    )
+
+    log(
+        "Final image bounds:"
+    )
+
+    log(
+        f"  west  = {image_info['west']}"
+    )
+
+    log(
+        f"  south = {image_info['south']}"
+    )
+
+    log(
+        f"  east  = {image_info['east']}"
+    )
+
+    log(
+        f"  north = {image_info['north']}"
+    )
 
     # --------------------------------------------------------
     # Metadata
     # --------------------------------------------------------
 
     metadata = {
-
-        "source":
-            "Copernicus GWIS / ECMWF",
-
-        "layer":
-            LAYER_NAME,
-
-        "date":
-            target_date,
-
-        "crs":
-            "EPSG:4326",
-
+        "source": "Copernicus GWIS / ECMWF",
+        "layer": LAYER_NAME,
+        "date": FORECAST_DATE.isoformat(),
+        "crs": TARGET_CRS,
 
         "image": {
-
-            "file":
-                OUTPUT_IMAGE.name,
-
-            "width":
-                clipped_width,
-
-            "height":
-                clipped_height,
-
+            "file": PNG_FILE.name,
+            "width": image_info["width"],
+            "height": image_info["height"],
         },
 
-
-        # Original WMS request extent
         "wms_bbox": {
-
-            "west":
-                wms_bbox[0],
-
-            "south":
-                wms_bbox[1],
-
-            "east":
-                wms_bbox[2],
-
-            "north":
-                wms_bbox[3],
-
+            "west": west,
+            "south": south,
+            "east": east,
+            "north": north,
         },
 
-
-        # Actual geographic extent
-        # of the cropped raster
         "image_bounds": {
-
-            "west":
-                image_bounds[0],
-
-            "south":
-                image_bounds[1],
-
-            "east":
-                image_bounds[2],
-
-            "north":
-                image_bounds[3],
-
+            "west": image_info["west"],
+            "south": image_info["south"],
+            "east": image_info["east"],
+            "north": image_info["north"],
         },
 
-
-        # Original Iran boundary
         "iran_boundary": {
-
-            "west":
-                iran_west,
-
-            "south":
-                iran_south,
-
-            "east":
-                iran_east,
-
-            "north":
-                iran_north,
-
-            "file":
-                "IRAN.geojson",
-
+            "west": west,
+            "south": south,
+            "east": east,
+            "north": north,
+            "file": "IRAN.geojson",
         },
-
 
         "georeferencing": {
-
-            "method":
-                "EPSG:4326 georeferenced GeoTIFF followed by exact geographic crop using IRAN.geojson",
-
-            "clip":
-                "IRAN.geojson",
-
-            "crop":
-                True,
-
+            "method": (
+                "WMS tiles -> EPSG:4326 GeoTIFF "
+                "-> exact IRAN.geojson mask/crop "
+                "-> PNG"
+            ),
+            "clip": "IRAN.geojson",
+            "image_bounds_source": (
+                "rasterio.transform.array_bounds"
+            ),
         },
 
-
-        "download": {
-
-            "main_tiles":
-                f"{TILES_X}x{TILES_Y}",
-
-            "fallback_tiles":
-                f"{FALLBACK_TILES_X}x"
-                f"{FALLBACK_TILES_Y}",
-
+        "tile_grid": {
+            "columns": NX,
+            "rows": NY,
+            "tile_width": tile_width,
+            "tile_height": tile_height,
         },
 
+        "generated_at_utc": (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        ),
     }
 
-
     with open(
-
-        OUTPUT_JSON,
-
+        JSON_FILE,
         "w",
-
-        encoding="utf-8"
-
+        encoding="utf-8",
     ) as f:
 
         json.dump(
-
             metadata,
-
             f,
-
             ensure_ascii=False,
-
-            indent=2
-
+            indent=2,
         )
 
-
-    print(
-        "Metadata created:"
+    log("")
+    log(
+        f"Metadata: {JSON_FILE}"
     )
 
-    print(
-        OUTPUT_JSON
-    )
+    # --------------------------------------------------------
+    # Final validation
+    # --------------------------------------------------------
 
+    if not PNG_FILE.exists():
+        raise RuntimeError(
+            "Final PNG was not created."
+        )
 
-    print(
-        "============================================================"
-    )
+    if not JSON_FILE.exists():
+        raise RuntimeError(
+            "Final JSON was not created."
+        )
 
-    print(
-        "IR-FWI UPDATE COMPLETED"
-    )
+    png_size = PNG_FILE.stat().st_size
+    json_size = JSON_FILE.stat().st_size
 
-    print(
-        "============================================================"
+    if png_size < 1000:
+        raise RuntimeError(
+            f"Final PNG is suspiciously small: "
+            f"{png_size} bytes"
+        )
+
+    if json_size < 100:
+        raise RuntimeError(
+            f"Final JSON is suspiciously small: "
+            f"{json_size} bytes"
+        )
+
+    log("")
+    log("=" * 70)
+    log("BUILD SUCCESSFUL")
+    log("=" * 70)
+    log("")
+    log(
+        f"PNG : {PNG_FILE}"
     )
+    log(
+        f"JSON: {JSON_FILE}"
+    )
+    log("")
 
 
 if __name__ == "__main__":
-
     main()
