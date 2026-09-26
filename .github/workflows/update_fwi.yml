@@ -21,6 +21,10 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
 
       # ----------------------------------------------------
@@ -67,7 +71,7 @@ jobs:
           python scripts/update_fwi.py
 
       # ----------------------------------------------------
-      # Check output
+      # Check generated files
       # ----------------------------------------------------
 
       - name: Check generated files
@@ -80,7 +84,7 @@ jobs:
           ls -lh web/
 
       # ----------------------------------------------------
-      # Configure Pages
+      # Configure GitHub Pages
       # ----------------------------------------------------
 
       - name: Configure GitHub Pages
@@ -104,7 +108,7 @@ jobs:
         uses: actions/deploy-pages@v4
 
       # ----------------------------------------------------
-      # Save generated FWI
+      # Commit generated FWI
       # ----------------------------------------------------
 
       - name: Commit generated FWI
