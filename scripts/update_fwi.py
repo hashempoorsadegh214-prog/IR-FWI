@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 
 import io
@@ -34,13 +35,20 @@ WMS_URL = "https://maps.effis.emergency.copernicus.eu/gwis"
 
 LAYER_NAME = "ecmwf.fwi"
 
-IMAGE_WIDTH = 2200
+# Final image width.
+# The final image is assembled from smaller WMS tiles.
+IMAGE_WIDTH = 1600
+
+# Number of tiles in X and Y directions.
+# 2 x 2 means 4 smaller WMS requests.
+TILES_X = 2
+TILES_Y = 2
 
 TIMEOUT = 180
 
 MAX_DOWNLOAD_ATTEMPTS = 5
 
-RETRY_WAIT_SECONDS = 10
+RETRY_WAIT_SECONDS = 8
 
 
 # ============================================================
@@ -329,17 +337,147 @@ def clip_image_to_boundary(
 
 
 # ============================================================
-# Download FWI from GWIS
+# Calculate tile BBOX
 # ============================================================
 
-def download_fwi(
+def get_tile_bbox(
     bbox,
-    target_date,
-    image_width,
-    image_height,
+    tile_x,
+    tile_y,
+    tiles_x,
+    tiles_y,
 ):
 
     minx, miny, maxx, maxy = bbox
+
+    geographic_width = (
+        maxx - minx
+    )
+
+    geographic_height = (
+        maxy - miny
+    )
+
+    tile_width = (
+        geographic_width
+        /
+        tiles_x
+    )
+
+    tile_height = (
+        geographic_height
+        /
+        tiles_y
+    )
+
+    tile_minx = (
+        minx
+        +
+        tile_x * tile_width
+    )
+
+    tile_maxx = (
+        minx
+        +
+        (tile_x + 1) * tile_width
+    )
+
+    # tile_y = 0 is the northern row.
+    tile_maxy = (
+        maxy
+        -
+        tile_y * tile_height
+    )
+
+    tile_miny = (
+        maxy
+        -
+        (tile_y + 1) * tile_height
+    )
+
+    return (
+        tile_minx,
+        tile_miny,
+        tile_maxx,
+        tile_maxy,
+    )
+
+
+# ============================================================
+# Calculate tile image dimensions
+# ============================================================
+
+def get_tile_dimensions(
+    final_width,
+    final_height,
+    tiles_x,
+    tiles_y,
+    tile_x,
+    tile_y,
+):
+
+    base_width = (
+        final_width
+        //
+        tiles_x
+    )
+
+    base_height = (
+        final_height
+        //
+        tiles_y
+    )
+
+    if tile_x == tiles_x - 1:
+
+        tile_width = (
+            final_width
+            -
+            base_width * (
+                tiles_x - 1
+            )
+        )
+
+    else:
+
+        tile_width = base_width
+
+    if tile_y == tiles_y - 1:
+
+        tile_height = (
+            final_height
+            -
+            base_height * (
+                tiles_y - 1
+            )
+        )
+
+    else:
+
+        tile_height = base_height
+
+    return (
+        tile_width,
+        tile_height,
+    )
+
+
+# ============================================================
+# Download one WMS tile
+# ============================================================
+
+def download_wms_tile(
+    tile_bbox,
+    target_date,
+    tile_width,
+    tile_height,
+    tile_number,
+    total_tiles,
+):
+
+    minx, miny, maxx, maxy = (
+        tile_bbox
+    )
 
     params = {
 
@@ -359,10 +497,10 @@ def download_fwi(
             f"{minx},{miny},{maxx},{maxy}",
 
         "WIDTH":
-            image_width,
+            tile_width,
 
         "HEIGHT":
-            image_height,
+            tile_height,
 
         "FORMAT":
             "image/png",
@@ -383,28 +521,20 @@ def download_fwi(
         "Accept":
             "image/png,image/*;q=0.9,*/*;q=0.8",
 
-        "Connection":
-            "close",
+        "Accept-Encoding":
+            "identity",
+
+        "Cache-Control":
+            "no-cache",
+
+        "Pragma":
+            "no-cache",
+
     }
 
     print()
     print(
-        "Downloading ECMWF FWI..."
-    )
-
-    print(
-        "URL:",
-        WMS_URL
-    )
-
-    print(
-        "Layer:",
-        LAYER_NAME
-    )
-
-    print(
-        "Date:",
-        target_date
+        f"Tile {tile_number}/{total_tiles}"
     )
 
     print(
@@ -413,13 +543,10 @@ def download_fwi(
     )
 
     print(
-        "Image width:",
-        image_width
-    )
-
-    print(
-        "Image height:",
-        image_height
+        "Size:",
+        tile_width,
+        "x",
+        tile_height
     )
 
     last_error = None
@@ -429,11 +556,13 @@ def download_fwi(
         MAX_DOWNLOAD_ATTEMPTS + 1,
     ):
 
-        print()
         print(
-            f"Download attempt "
+            f"Tile download attempt "
             f"{attempt}/{MAX_DOWNLOAD_ATTEMPTS}"
         )
+
+        session = None
+        response = None
 
         try:
 
@@ -456,6 +585,13 @@ def download_fwi(
                 )
             )
 
+            content_length = (
+                response.headers.get(
+                    "Content-Length",
+                    ""
+                )
+            )
+
             print(
                 "HTTP status:",
                 response.status_code
@@ -466,15 +602,20 @@ def download_fwi(
                 content_type
             )
 
+            if content_length:
+
+                print(
+                    "Content-Length:",
+                    content_length
+                )
+
             if (
                 "image"
                 not in
                 content_type.lower()
             ):
 
-                text = (
-                    response.text[:1000]
-                )
+                text = response.text[:1000]
 
                 raise RuntimeError(
                     "GWIS did not return an image.\n"
@@ -486,7 +627,7 @@ def download_fwi(
             total_bytes = 0
 
             for chunk in response.iter_content(
-                chunk_size=64 * 1024
+                chunk_size=32 * 1024
             ):
 
                 if chunk:
@@ -498,10 +639,6 @@ def download_fwi(
                     total_bytes += len(
                         chunk
                     )
-
-            response.close()
-
-            session.close()
 
             content = b"".join(
                 chunks
@@ -521,12 +658,26 @@ def download_fwi(
 
             image = Image.open(
                 io.BytesIO(content)
-            ).convert("RGBA")
+            ).convert(
+                "RGBA"
+            )
 
             print(
                 "Received image size:",
                 image.size
             )
+
+            if image.size != (
+                tile_width,
+                tile_height,
+            ):
+
+                raise RuntimeError(
+                    "Returned tile dimensions do not "
+                    "match requested dimensions. "
+                    f"Expected {tile_width}x{tile_height}, "
+                    f"received {image.size[0]}x{image.size[1]}."
+                )
 
             return image
 
@@ -534,9 +685,8 @@ def download_fwi(
 
             last_error = exc
 
-            print()
             print(
-                "Download failed:"
+                "Tile download failed:"
             )
 
             print(
@@ -555,17 +705,183 @@ def download_fwi(
                     RETRY_WAIT_SECONDS
                 )
 
-            else:
+        finally:
 
-                print(
-                    "All download attempts failed."
-                )
+            if response is not None:
+
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+            if session is not None:
+
+                try:
+                    session.close()
+                except Exception:
+                    pass
 
     raise RuntimeError(
-        "Unable to download FWI from "
-        "Copernicus GWIS after "
+        f"Unable to download WMS tile "
+        f"{tile_number}/{total_tiles} "
+        f"from Copernicus GWIS after "
         f"{MAX_DOWNLOAD_ATTEMPTS} attempts."
     ) from last_error
+
+
+# ============================================================
+# Download complete FWI using multiple tiles
+# ============================================================
+
+def download_fwi(
+    bbox,
+    target_date,
+    image_width,
+    image_height,
+):
+
+    print()
+    print(
+        "Downloading ECMWF FWI..."
+    )
+
+    print(
+        "URL:",
+        WMS_URL
+    )
+
+    print(
+        "Layer:",
+        LAYER_NAME
+    )
+
+    print(
+        "Date:",
+        target_date
+    )
+
+    print(
+        "Final image:",
+        image_width,
+        "x",
+        image_height
+    )
+
+    print(
+        "WMS tiles:",
+        f"{TILES_X} x {TILES_Y}"
+    )
+
+    total_tiles = (
+        TILES_X * TILES_Y
+    )
+
+    final_image = Image.new(
+        "RGBA",
+        (
+            image_width,
+            image_height,
+        ),
+        (0, 0, 0, 0),
+    )
+
+    x_offset = 0
+
+    for tile_x in range(
+        TILES_X
+    ):
+
+        tile_width = (
+            image_width
+            //
+            TILES_X
+        )
+
+        if tile_x == TILES_X - 1:
+
+            tile_width = (
+                image_width
+                -
+                (
+                    image_width
+                    //
+                    TILES_X
+                )
+                *
+                (
+                    TILES_X - 1
+                )
+            )
+
+        y_offset = 0
+
+        for tile_y in range(
+            TILES_Y
+        ):
+
+            tile_width, tile_height = (
+                get_tile_dimensions(
+                    final_width=image_width,
+                    final_height=image_height,
+                    tiles_x=TILES_X,
+                    tiles_y=TILES_Y,
+                    tile_x=tile_x,
+                    tile_y=tile_y,
+                )
+            )
+
+            tile_bbox = get_tile_bbox(
+                bbox=bbox,
+                tile_x=tile_x,
+                tile_y=tile_y,
+                tiles_x=TILES_X,
+                tiles_y=TILES_Y,
+            )
+
+            tile_number = (
+                tile_y * TILES_X
+                +
+                tile_x
+                +
+                1
+            )
+
+            tile = download_wms_tile(
+                tile_bbox=tile_bbox,
+                target_date=target_date,
+                tile_width=tile_width,
+                tile_height=tile_height,
+                tile_number=tile_number,
+                total_tiles=total_tiles,
+            )
+
+            final_image.paste(
+                tile,
+                (
+                    x_offset,
+                    y_offset,
+                )
+            )
+
+            y_offset += tile_height
+
+        x_offset += (
+            image_width
+            //
+            TILES_X
+        )
+
+    print()
+    print(
+        "All WMS tiles downloaded successfully."
+    )
+
+    print(
+        "Final assembled image size:",
+        final_image.size
+    )
+
+    return final_image
 
 
 # ============================================================
