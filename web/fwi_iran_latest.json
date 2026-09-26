@@ -1,0 +1,24 @@
+{
+  "source": "Copernicus GWIS / ECMWF",
+  "layer": "ecmwf.fwi",
+  "date": "2026-09-27",
+  "crs": "EPSG:4326",
+  "image": {
+    "file": "fwi_iran_latest.png",
+    "width": 2200,
+    "height": 1600
+  },
+  "bbox": {
+    "west": 43.85456214904802,
+    "south": 24.911563510894773,
+    "east": 63.51016105651861,
+    "north": 39.9244064140321
+  },
+  "iran_boundary": {
+    "west": 44.047264099121264,
+    "south": 25.058748245239258,
+    "east": 63.31745910644537,
+    "north": 39.777221679687614,
+    "file": "IRAN.geojson"
+  }
+}
