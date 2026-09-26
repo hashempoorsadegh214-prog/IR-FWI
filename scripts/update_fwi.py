@@ -1,186 +1,352 @@
 #!/usr/bin/env python3
+
+import io
 import json
-import os
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
+from pathlib import Path
 
 import geopandas as gpd
 import requests
 from PIL import Image, ImageDraw
+from shapely.geometry import mapping
+from shapely.ops import unary_union
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BOUNDARY_FILE = os.path.join(ROOT, "IRAN.geojson")
-WEB_DIR = os.path.join(ROOT, "web")
+
+# ============================================================
+# Paths
+# ============================================================
+
+ROOT = Path(__file__).resolve().parents[1]
+
+BOUNDARY_FILE = ROOT / "IRAN.geojson"
+WEB_DIR = ROOT / "web"
+
+OUTPUT_IMAGE = WEB_DIR / "fwi_iran_latest.png"
+OUTPUT_JSON = WEB_DIR / "fwi_iran_latest.json"
+
+
+# ============================================================
+# Copernicus GWIS / ECMWF FWI
+# ============================================================
 
 WMS_URL = "https://maps.effis.emergency.copernicus.eu/gwis"
-WMS_LAYER = "ecmwf.fwi"
 
-WIDTH = 2200
-HEIGHT = 1600
+LAYER_NAME = "ecmwf.fwi"
+
+IMAGE_WIDTH = 2200
+IMAGE_HEIGHT = 1600
+
 TIMEOUT = 180
 
-IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
-NOW = datetime.now(IRAN_TZ)
-TARGET = NOW.date() + timedelta(days=1)
-TARGET_DATE = TARGET.strftime("%Y-%m-%d")
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def load_iran_boundary():
+    if not BOUNDARY_FILE.exists():
+        raise FileNotFoundError(
+            f"Iran boundary not found: {BOUNDARY_FILE}"
+        )
+
+    gdf = gpd.read_file(BOUNDARY_FILE)
+
+    if gdf.empty:
+        raise RuntimeError("IRAN.geojson contains no geometry.")
+
+    if gdf.crs is None:
+        print("Boundary CRS is undefined. Assuming EPSG:4326.")
+        gdf = gdf.set_crs("EPSG:4326")
+
+    else:
+        gdf = gdf.to_crs("EPSG:4326")
+
+    geometry = unary_union(gdf.geometry)
+
+    if geometry.is_empty:
+        raise RuntimeError("Iran boundary geometry is empty.")
+
+    return geometry
 
 
-def ring_pixels(ring, west, south, east, north, width, height):
-    pixels = []
-    for lon, lat, *_ in ring.coords:
-        x = (lon - west) / (east - west) * (width - 1)
-        y = (north - lat) / (north - south) * (height - 1)
-        pixels.append((round(x), round(y)))
-    return pixels
+def get_bbox(geometry):
+    minx, miny, maxx, maxy = geometry.bounds
+
+    width = maxx - minx
+    height = maxy - miny
+
+    # Small margin only for WMS request.
+    margin_x = width * 0.01
+    margin_y = height * 0.01
+
+    return (
+        minx - margin_x,
+        miny - margin_y,
+        maxx + margin_x,
+        maxy + margin_y,
+    )
 
 
-def make_mask(geometry, west, south, east, north, width, height):
+def geometry_to_pixel_mask(geometry, bbox, width, height):
+    minx, miny, maxx, maxy = bbox
+
     mask = Image.new("L", (width, height), 0)
     draw = ImageDraw.Draw(mask)
 
-    if geometry.geom_type == "Polygon":
-        polygons = [geometry]
-    elif geometry.geom_type == "MultiPolygon":
-        polygons = list(geometry.geoms)
+    def to_pixel(x, y):
+        px = (x - minx) / (maxx - minx) * (width - 1)
+        py = (maxy - y) / (maxy - miny) * (height - 1)
+
+        return int(round(px)), int(round(py))
+
+    def draw_polygon(coords):
+        pixels = [to_pixel(x, y) for x, y in coords]
+        if len(pixels) >= 3:
+            draw.polygon(pixels, fill=255)
+
+    geojson = mapping(geometry)
+
+    if geojson["type"] == "Polygon":
+
+        coordinates = geojson["coordinates"]
+
+        # Exterior
+        draw_polygon(coordinates[0])
+
+        # Holes
+        for hole in coordinates[1:]:
+            pixels = [to_pixel(x, y) for x, y in hole]
+            if len(pixels) >= 3:
+                draw.polygon(pixels, fill=0)
+
+    elif geojson["type"] == "MultiPolygon":
+
+        for polygon in geojson["coordinates"]:
+
+            # Exterior
+            draw_polygon(polygon[0])
+
+            # Holes
+            for hole in polygon[1:]:
+                pixels = [to_pixel(x, y) for x, y in hole]
+                if len(pixels) >= 3:
+                    draw.polygon(pixels, fill=0)
+
     else:
-        polygons = []
-
-    for polygon in polygons:
-        draw.polygon(
-            ring_pixels(
-                polygon.exterior,
-                west, south, east, north,
-                width, height
-            ),
-            fill=255,
+        raise RuntimeError(
+            f"Unsupported boundary geometry type: {geojson['type']}"
         )
-
-        for hole in polygon.interiors:
-            draw.polygon(
-                ring_pixels(
-                    hole,
-                    west, south, east, north,
-                    width, height
-                ),
-                fill=0,
-            )
 
     return mask
 
 
-def main():
-    if not os.path.exists(BOUNDARY_FILE):
-        raise FileNotFoundError(
-            f"Missing boundary file: {BOUNDARY_FILE}"
-        )
+def clip_image_to_boundary(image, geometry, bbox):
+    image = image.convert("RGBA")
 
-    os.makedirs(WEB_DIR, exist_ok=True)
+    mask = geometry_to_pixel_mask(
+        geometry,
+        bbox,
+        image.width,
+        image.height,
+    )
 
-    iran = gpd.read_file(BOUNDARY_FILE)
+    alpha = image.getchannel("A")
 
-    if iran.empty:
-        raise RuntimeError("IRAN.geojson is empty.")
+    # Keep pixels only inside Iran.
+    combined_alpha = Image.composite(
+        alpha,
+        Image.new("L", image.size, 0),
+        mask,
+    )
 
-    if iran.crs is None:
-        iran = iran.set_crs("EPSG:4326")
-    else:
-        iran = iran.to_crs("EPSG:4326")
+    image.putalpha(combined_alpha)
 
-    geometry = iran.geometry.union_all()
+    return image
 
-    west, south, east, north = geometry.bounds
 
-    # Tiny margin around the actual uploaded Iran boundary.
-    margin_x = (east - west) * 0.01
-    margin_y = (north - south) * 0.01
+# ============================================================
+# Download FWI
+# ============================================================
 
-    west -= margin_x
-    east += margin_x
-    south -= margin_y
-    north += margin_y
-
-    bbox = f"{west},{south},{east},{north}"
+def download_fwi(bbox, target_date):
+    minx, miny, maxx, maxy = bbox
 
     params = {
         "SERVICE": "WMS",
         "VERSION": "1.1.1",
         "REQUEST": "GetMap",
-        "LAYERS": WMS_LAYER,
+        "LAYERS": LAYER_NAME,
         "STYLES": "",
         "SRS": "EPSG:4326",
-        "BBOX": bbox,
-        "WIDTH": str(WIDTH),
-        "HEIGHT": str(HEIGHT),
+        "BBOX": f"{minx},{miny},{maxx},{maxy}",
+        "WIDTH": IMAGE_WIDTH,
+        "HEIGHT": IMAGE_HEIGHT,
         "FORMAT": "image/png",
         "TRANSPARENT": "TRUE",
-        "TIME": TARGET_DATE,
+        "TIME": target_date,
     }
 
-    print("================================")
-    print("IRAN FWI")
-    print("================================")
-    print("Forecast:", TARGET_DATE)
-    print("Boundary:", BOUNDARY_FILE)
-    print("Layer:", WMS_LAYER)
-    print("BBOX:", bbox)
+    print("Downloading ECMWF FWI...")
+    print("URL:", WMS_URL)
+    print("Layer:", LAYER_NAME)
+    print("Date:", target_date)
+    print("BBOX:", params["BBOX"])
 
     response = requests.get(
         WMS_URL,
         params=params,
         timeout=TIMEOUT,
-        headers={"User-Agent": "IR-FWI/1.0"},
     )
+
     response.raise_for_status()
 
-    content_type = response.headers.get("content-type", "")
+    content_type = response.headers.get("Content-Type", "")
+
+    print("HTTP status:", response.status_code)
+    print("Content-Type:", content_type)
+    print("Downloaded:", len(response.content), "bytes")
+
     if "image" not in content_type.lower():
+        print(response.text[:1000])
         raise RuntimeError(
-            "GWIS did not return an image. "
-            f"Content-Type={content_type}"
+            "GWIS did not return an image."
         )
 
-    image = Image.open(BytesIO(response.content)).convert("RGBA")
+    return Image.open(io.BytesIO(response.content)).convert("RGBA")
 
-    # Exact clipping to the uploaded Iran boundary.
-    mask = make_mask(
-        geometry,
-        west, south, east, north,
-        image.width, image.height
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+
+    print("=" * 70)
+    print("IR-FWI - Iran ECMWF FWI")
+    print("=" * 70)
+
+    WEB_DIR.mkdir(parents=True, exist_ok=True)
+
+    # --------------------------------------------------------
+    # Load Iran boundary
+    # --------------------------------------------------------
+
+    iran_geometry = load_iran_boundary()
+
+    print("Iran boundary loaded.")
+
+    minx, miny, maxx, maxy = iran_geometry.bounds
+
+    print("Original Iran bounds:")
+    print("West :", minx)
+    print("South:", miny)
+    print("East :", maxx)
+    print("North:", maxy)
+
+    # --------------------------------------------------------
+    # WMS request bbox
+    # --------------------------------------------------------
+
+    bbox = get_bbox(iran_geometry)
+
+    print()
+    print("WMS BBOX:")
+    print("West :", bbox[0])
+    print("South:", bbox[1])
+    print("East :", bbox[2])
+    print("North:", bbox[3])
+
+    # --------------------------------------------------------
+    # Date
+    # --------------------------------------------------------
+
+    today = datetime.now(timezone.utc).date()
+
+    target_date = today + timedelta(days=1)
+
+    target_date_str = target_date.isoformat()
+
+    # --------------------------------------------------------
+    # Download
+    # --------------------------------------------------------
+
+    image = download_fwi(
+        bbox=bbox,
+        target_date=target_date_str,
     )
-    image.putalpha(mask)
 
-    image_path = os.path.join(WEB_DIR, "fwi_iran_latest.png")
-    meta_path = os.path.join(WEB_DIR, "fwi_iran_latest.json")
+    print("Image size:", image.size)
 
-    image.save(image_path, optimize=True)
+    # --------------------------------------------------------
+    # Clip exactly to Iran boundary
+    # --------------------------------------------------------
+
+    print("Clipping image to IRAN.geojson...")
+
+    clipped = clip_image_to_boundary(
+        image=image,
+        geometry=iran_geometry,
+        bbox=bbox,
+    )
+
+    # --------------------------------------------------------
+    # Save image
+    # --------------------------------------------------------
+
+    clipped.save(
+        OUTPUT_IMAGE,
+        format="PNG",
+        optimize=True,
+    )
+
+    print("Saved:", OUTPUT_IMAGE)
+
+    # --------------------------------------------------------
+    # Metadata
+    # --------------------------------------------------------
 
     metadata = {
-        "forecast_gregorian": TARGET_DATE,
-        "generated_at_iran": NOW.strftime("%Y-%m-%d %H:%M"),
-        "source": "Copernicus EFFIS / ECMWF GWIS",
-        "layer": WMS_LAYER,
+        "source": "Copernicus GWIS / ECMWF",
+        "layer": LAYER_NAME,
+        "date": target_date_str,
         "crs": "EPSG:4326",
-        "region": "Iran",
-        "boundary": "IRAN.geojson",
-        "bbox": [west, south, east, north],
+
         "image": {
-            "url": "fwi_iran_latest.png",
-            "width": image.width,
-            "height": image.height
-        }
+            "file": OUTPUT_IMAGE.name,
+            "width": clipped.width,
+            "height": clipped.height,
+        },
+
+        "bbox": {
+            "west": bbox[0],
+            "south": bbox[1],
+            "east": bbox[2],
+            "north": bbox[3],
+        },
+
+        "iran_boundary": {
+            "west": minx,
+            "south": miny,
+            "east": maxx,
+            "north": maxy,
+            "file": "IRAN.geojson",
+        },
     }
 
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(
+    OUTPUT_JSON.write_text(
+        json.dumps(
             metadata,
-            f,
             ensure_ascii=False,
-            indent=2
-        )
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
-    print("Saved:", image_path)
-    print("Saved:", meta_path)
-    print("================================")
+    print("Saved:", OUTPUT_JSON)
+
+    print("=" * 70)
+    print("DONE")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
