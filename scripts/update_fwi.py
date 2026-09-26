@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 
 import io
@@ -8,8 +7,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
+import rasterio
 import requests
-from PIL import Image, ImageDraw
+from PIL import Image
+from rasterio.io import MemoryFile
+from rasterio.mask import mask
+from rasterio.transform import from_bounds
 from shapely.geometry import mapping
 from shapely.ops import unary_union
 
@@ -26,6 +30,8 @@ WEB_DIR = ROOT / "web"
 OUTPUT_IMAGE = WEB_DIR / "fwi_iran_latest.png"
 OUTPUT_JSON = WEB_DIR / "fwi_iran_latest.json"
 
+TEMP_GEOTIFF = WEB_DIR / "fwi_iran_working.tif"
+
 
 # ============================================================
 # Copernicus GWIS / ECMWF FWI
@@ -35,12 +41,8 @@ WMS_URL = "https://maps.effis.emergency.copernicus.eu/gwis"
 
 LAYER_NAME = "ecmwf.fwi"
 
-# Final image width.
-# The final image is assembled from smaller WMS tiles.
 IMAGE_WIDTH = 1600
 
-# Number of tiles in X and Y directions.
-# 2 x 2 means 4 smaller WMS requests.
 TILES_X = 2
 TILES_Y = 2
 
@@ -106,9 +108,7 @@ def load_iran_boundary():
 
 def get_bbox(geometry):
 
-    minx, miny, maxx, maxy = (
-        geometry.bounds
-    )
+    minx, miny, maxx, maxy = geometry.bounds
 
     width = maxx - minx
     height = maxy - miny
@@ -132,36 +132,26 @@ def get_image_dimensions(bbox):
 
     minx, miny, maxx, maxy = bbox
 
-    geographic_width = (
-        maxx - minx
-    )
-
-    geographic_height = (
-        maxy - miny
-    )
+    geographic_width = maxx - minx
+    geographic_height = maxy - miny
 
     if geographic_width <= 0:
-
         raise RuntimeError(
             "Invalid BBOX width."
         )
 
     if geographic_height <= 0:
-
         raise RuntimeError(
             "Invalid BBOX height."
         )
 
     image_height = round(
         IMAGE_WIDTH
-        *
-        geographic_height
-        /
-        geographic_width
+        * geographic_height
+        / geographic_width
     )
 
     if image_height <= 0:
-
         raise RuntimeError(
             "Calculated image height is invalid."
         )
@@ -170,170 +160,6 @@ def get_image_dimensions(bbox):
         IMAGE_WIDTH,
         image_height,
     )
-
-
-# ============================================================
-# Convert geographic geometry to pixel mask
-# ============================================================
-
-def geometry_to_pixel_mask(
-    geometry,
-    bbox,
-    width,
-    height,
-):
-
-    minx, miny, maxx, maxy = bbox
-
-    mask = Image.new(
-        "L",
-        (width, height),
-        0,
-    )
-
-    draw = ImageDraw.Draw(
-        mask
-    )
-
-    def to_pixel(x, y):
-
-        px = (
-            (x - minx)
-            /
-            (maxx - minx)
-            *
-            (width - 1)
-        )
-
-        py = (
-            (maxy - y)
-            /
-            (maxy - miny)
-            *
-            (height - 1)
-        )
-
-        return (
-            int(round(px)),
-            int(round(py)),
-        )
-
-    def draw_polygon(coords):
-
-        pixels = [
-            to_pixel(x, y)
-            for x, y in coords
-        ]
-
-        if len(pixels) >= 3:
-
-            draw.polygon(
-                pixels,
-                fill=255,
-            )
-
-    geojson = mapping(
-        geometry
-    )
-
-    if geojson["type"] == "Polygon":
-
-        coordinates = (
-            geojson["coordinates"]
-        )
-
-        draw_polygon(
-            coordinates[0]
-        )
-
-        for hole in coordinates[1:]:
-
-            pixels = [
-                to_pixel(x, y)
-                for x, y in hole
-            ]
-
-            if len(pixels) >= 3:
-
-                draw.polygon(
-                    pixels,
-                    fill=0,
-                )
-
-    elif geojson["type"] == "MultiPolygon":
-
-        for polygon in (
-            geojson["coordinates"]
-        ):
-
-            draw_polygon(
-                polygon[0]
-            )
-
-            for hole in polygon[1:]:
-
-                pixels = [
-                    to_pixel(x, y)
-                    for x, y in hole
-                ]
-
-                if len(pixels) >= 3:
-
-                    draw.polygon(
-                        pixels,
-                        fill=0,
-                    )
-
-    else:
-
-        raise RuntimeError(
-            "Unsupported boundary geometry type: "
-            f"{geojson['type']}"
-        )
-
-    return mask
-
-
-# ============================================================
-# Clip image exactly to Iran boundary
-# ============================================================
-
-def clip_image_to_boundary(
-    image,
-    geometry,
-    bbox,
-):
-
-    image = image.convert(
-        "RGBA"
-    )
-
-    mask = geometry_to_pixel_mask(
-        geometry=geometry,
-        bbox=bbox,
-        width=image.width,
-        height=image.height,
-    )
-
-    alpha = image.getchannel(
-        "A"
-    )
-
-    combined_alpha = Image.composite(
-        alpha,
-        Image.new(
-            "L",
-            image.size,
-            0,
-        ),
-        mask,
-    )
-
-    image.putalpha(
-        combined_alpha
-    )
-
-    return image
 
 
 # ============================================================
@@ -350,49 +176,32 @@ def get_tile_bbox(
 
     minx, miny, maxx, maxy = bbox
 
-    geographic_width = (
-        maxx - minx
-    )
-
-    geographic_height = (
-        maxy - miny
-    )
+    geographic_width = maxx - minx
+    geographic_height = maxy - miny
 
     tile_width = (
-        geographic_width
-        /
-        tiles_x
+        geographic_width / tiles_x
     )
 
     tile_height = (
-        geographic_height
-        /
-        tiles_y
+        geographic_height / tiles_y
     )
 
     tile_minx = (
-        minx
-        +
-        tile_x * tile_width
+        minx + tile_x * tile_width
     )
 
     tile_maxx = (
-        minx
-        +
-        (tile_x + 1) * tile_width
+        minx + (tile_x + 1) * tile_width
     )
 
-    # tile_y = 0 is the northern row.
+    # Row 0 = north
     tile_maxy = (
-        maxy
-        -
-        tile_y * tile_height
+        maxy - tile_y * tile_height
     )
 
     tile_miny = (
-        maxy
-        -
-        (tile_y + 1) * tile_height
+        maxy - (tile_y + 1) * tile_height
     )
 
     return (
@@ -404,7 +213,7 @@ def get_tile_bbox(
 
 
 # ============================================================
-# Calculate tile image dimensions
+# Calculate tile dimensions
 # ============================================================
 
 def get_tile_dimensions(
@@ -417,25 +226,18 @@ def get_tile_dimensions(
 ):
 
     base_width = (
-        final_width
-        //
-        tiles_x
+        final_width // tiles_x
     )
 
     base_height = (
-        final_height
-        //
-        tiles_y
+        final_height // tiles_y
     )
 
     if tile_x == tiles_x - 1:
 
         tile_width = (
             final_width
-            -
-            base_width * (
-                tiles_x - 1
-            )
+            - base_width * (tiles_x - 1)
         )
 
     else:
@@ -446,10 +248,7 @@ def get_tile_dimensions(
 
         tile_height = (
             final_height
-            -
-            base_height * (
-                tiles_y - 1
-            )
+            - base_height * (tiles_y - 1)
         )
 
     else:
@@ -475,9 +274,7 @@ def download_wms_tile(
     total_tiles,
 ):
 
-    minx, miny, maxx, maxy = (
-        tile_bbox
-    )
+    minx, miny, maxx, maxy = tile_bbox
 
     params = {
 
@@ -515,8 +312,7 @@ def download_wms_tile(
     headers = {
 
         "User-Agent":
-            "IR-FWI/1.0 "
-            "(GitHub Actions)",
+            "IR-FWI/2.0 (GitHub Actions)",
 
         "Accept":
             "image/png,image/*;q=0.9,*/*;q=0.8",
@@ -529,7 +325,6 @@ def download_wms_tile(
 
         "Pragma":
             "no-cache",
-
     }
 
     print()
@@ -556,19 +351,16 @@ def download_wms_tile(
         MAX_DOWNLOAD_ATTEMPTS + 1,
     ):
 
-        print(
-            f"Tile download attempt "
-            f"{attempt}/{MAX_DOWNLOAD_ATTEMPTS}"
-        )
-
-        session = None
         response = None
 
         try:
 
-            session = requests.Session()
+            print(
+                f"Tile download attempt "
+                f"{attempt}/{MAX_DOWNLOAD_ATTEMPTS}"
+            )
 
-            response = session.get(
+            response = requests.get(
                 WMS_URL,
                 params=params,
                 headers=headers,
@@ -585,13 +377,6 @@ def download_wms_tile(
                 )
             )
 
-            content_length = (
-                response.headers.get(
-                    "Content-Length",
-                    ""
-                )
-            )
-
             print(
                 "HTTP status:",
                 response.status_code
@@ -602,18 +387,7 @@ def download_wms_tile(
                 content_type
             )
 
-            if content_length:
-
-                print(
-                    "Content-Length:",
-                    content_length
-                )
-
-            if (
-                "image"
-                not in
-                content_type.lower()
-            ):
+            if "image" not in content_type.lower():
 
                 text = response.text[:1000]
 
@@ -632,17 +406,11 @@ def download_wms_tile(
 
                 if chunk:
 
-                    chunks.append(
-                        chunk
-                    )
+                    chunks.append(chunk)
 
-                    total_bytes += len(
-                        chunk
-                    )
+                    total_bytes += len(chunk)
 
-            content = b"".join(
-                chunks
-            )
+            content = b"".join(chunks)
 
             print(
                 "Downloaded:",
@@ -658,9 +426,7 @@ def download_wms_tile(
 
             image = Image.open(
                 io.BytesIO(content)
-            ).convert(
-                "RGBA"
-            )
+            ).convert("RGBA")
 
             print(
                 "Received image size:",
@@ -675,8 +441,10 @@ def download_wms_tile(
                 raise RuntimeError(
                     "Returned tile dimensions do not "
                     "match requested dimensions. "
-                    f"Expected {tile_width}x{tile_height}, "
-                    f"received {image.size[0]}x{image.size[1]}."
+                    f"Expected "
+                    f"{tile_width}x{tile_height}, "
+                    f"received "
+                    f"{image.width}x{image.height}."
                 )
 
             return image
@@ -714,23 +482,16 @@ def download_wms_tile(
                 except Exception:
                     pass
 
-            if session is not None:
-
-                try:
-                    session.close()
-                except Exception:
-                    pass
-
     raise RuntimeError(
         f"Unable to download WMS tile "
         f"{tile_number}/{total_tiles} "
-        f"from Copernicus GWIS after "
+        f"after "
         f"{MAX_DOWNLOAD_ATTEMPTS} attempts."
     ) from last_error
 
 
 # ============================================================
-# Download complete FWI using multiple tiles
+# Download all WMS tiles and assemble them
 # ============================================================
 
 def download_fwi(
@@ -785,38 +546,12 @@ def download_fwi(
         (0, 0, 0, 0),
     )
 
-    x_offset = 0
-
-    for tile_x in range(
-        TILES_X
+    for tile_y in range(
+        TILES_Y
     ):
 
-        tile_width = (
-            image_width
-            //
+        for tile_x in range(
             TILES_X
-        )
-
-        if tile_x == TILES_X - 1:
-
-            tile_width = (
-                image_width
-                -
-                (
-                    image_width
-                    //
-                    TILES_X
-                )
-                *
-                (
-                    TILES_X - 1
-                )
-            )
-
-        y_offset = 0
-
-        for tile_y in range(
-            TILES_Y
         ):
 
             tile_width, tile_height = (
@@ -840,10 +575,8 @@ def download_fwi(
 
             tile_number = (
                 tile_y * TILES_X
-                +
-                tile_x
-                +
-                1
+                + tile_x
+                + 1
             )
 
             tile = download_wms_tile(
@@ -855,6 +588,16 @@ def download_fwi(
                 total_tiles=total_tiles,
             )
 
+            x_offset = (
+                tile_x
+                * (image_width // TILES_X)
+            )
+
+            y_offset = (
+                tile_y
+                * (image_height // TILES_Y)
+            )
+
             final_image.paste(
                 tile,
                 (
@@ -862,14 +605,6 @@ def download_fwi(
                     y_offset,
                 )
             )
-
-            y_offset += tile_height
-
-        x_offset += (
-            image_width
-            //
-            TILES_X
-        )
 
     print()
     print(
@@ -882,6 +617,208 @@ def download_fwi(
     )
 
     return final_image
+
+
+# ============================================================
+# Convert assembled PNG to georeferenced GeoTIFF
+# ============================================================
+
+def create_georeferenced_geotiff(
+    image,
+    bbox,
+    output_path,
+):
+
+    print()
+    print(
+        "Creating georeferenced GeoTIFF..."
+    )
+
+    width = image.width
+    height = image.height
+
+    transform = from_bounds(
+        bbox[0],
+        bbox[1],
+        bbox[2],
+        bbox[3],
+        width,
+        height,
+    )
+
+    rgba = np.asarray(
+        image,
+        dtype=np.uint8,
+    )
+
+    with rasterio.open(
+        output_path,
+        "w",
+        driver="GTiff",
+        width=width,
+        height=height,
+        count=4,
+        dtype="uint8",
+        crs="EPSG:4326",
+        transform=transform,
+        compress="deflate",
+        predictor=2,
+        tiled=True,
+    ) as dst:
+
+        dst.write(
+            rgba[:, :, 0],
+            1,
+        )
+
+        dst.write(
+            rgba[:, :, 1],
+            2,
+        )
+
+        dst.write(
+            rgba[:, :, 2],
+            3,
+        )
+
+        dst.write(
+            rgba[:, :, 3],
+            4,
+        )
+
+    print(
+        "GeoTIFF created:",
+        output_path
+    )
+
+    print(
+        "CRS: EPSG:4326"
+    )
+
+    print(
+        "Transform:",
+        transform
+    )
+
+
+# ============================================================
+# Clip georeferenced raster to Iran boundary
+# ============================================================
+
+def clip_geotiff_to_iran(
+    geotiff_path,
+    geometry,
+):
+
+    print()
+    print(
+        "Clipping georeferenced raster "
+        "to IRAN.geojson..."
+    )
+
+    with rasterio.open(
+        geotiff_path,
+    ) as src:
+
+        print(
+            "Source CRS:",
+            src.crs
+        )
+
+        print(
+            "Source bounds:",
+            src.bounds
+        )
+
+        print(
+            "Source size:",
+            src.width,
+            "x",
+            src.height
+        )
+
+        if src.crs is None:
+
+            raise RuntimeError(
+                "GeoTIFF has no CRS."
+            )
+
+        clipped, clipped_transform = mask(
+            src,
+            [mapping(geometry)],
+            crop=False,
+            filled=True,
+            nodata=0,
+        )
+
+        profile = src.profile.copy()
+
+        profile.update(
+            transform=clipped_transform,
+            width=clipped.shape[2],
+            height=clipped.shape[1],
+            count=4,
+            dtype="uint8",
+            compress="deflate",
+            predictor=2,
+        )
+
+        print(
+            "Clip completed."
+        )
+
+        return clipped, profile
+
+
+# ============================================================
+# Convert clipped raster to web PNG
+# ============================================================
+
+def save_web_png(
+    clipped,
+    output_path,
+):
+
+    print()
+    print(
+        "Creating final web PNG..."
+    )
+
+    if clipped.shape[0] != 4:
+
+        raise RuntimeError(
+            "Expected a 4-band RGBA raster."
+        )
+
+    rgba = np.transpose(
+        clipped,
+        (1, 2, 0),
+    )
+
+    image = Image.fromarray(
+        rgba,
+        mode="RGBA",
+    )
+
+    image.save(
+        output_path,
+        format="PNG",
+        optimize=True,
+    )
+
+    print(
+        "Saved:",
+        output_path
+    )
+
+    print(
+        "PNG size:",
+        image.width,
+        "x",
+        image.height
+    )
+
+    return image
 
 
 # ============================================================
@@ -945,7 +882,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # WMS BBOX
+    # BBOX
     # --------------------------------------------------------
 
     bbox = get_bbox(
@@ -1036,8 +973,7 @@ def main():
     )
 
     target_date = (
-        today +
-        timedelta(days=1)
+        today + timedelta(days=1)
     )
 
     target_date_str = (
@@ -1051,7 +987,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Download
+    # Download WMS
     # --------------------------------------------------------
 
     image = download_fwi(
@@ -1062,61 +998,50 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Validate image size
+    # Create georeferenced GeoTIFF
     # --------------------------------------------------------
 
-    print()
-    print(
-        "Downloaded image size:",
-        image.size
+    create_georeferenced_geotiff(
+        image=image,
+        bbox=bbox,
+        output_path=TEMP_GEOTIFF,
     )
 
-    if image.size != (
-        image_width,
-        image_height,
-    ):
-
-        raise RuntimeError(
-            "Returned image dimensions do not "
-            "match requested dimensions."
-        )
-
     # --------------------------------------------------------
-    # Clip to Iran
+    # Clip using actual geographic geometry
     # --------------------------------------------------------
 
-    print()
-    print(
-        "Clipping image to IRAN.geojson..."
-    )
-
-    clipped = (
-        clip_image_to_boundary(
-            image=image,
+    clipped, profile = (
+        clip_geotiff_to_iran(
+            geotiff_path=TEMP_GEOTIFF,
             geometry=iran_geometry,
-            bbox=bbox,
         )
-    )
-
-    print(
-        "Clipping completed."
     )
 
     # --------------------------------------------------------
     # Save PNG
     # --------------------------------------------------------
 
-    clipped.save(
-        OUTPUT_IMAGE,
-        format="PNG",
-        optimize=True,
+    final_image = save_web_png(
+        clipped=clipped,
+        output_path=OUTPUT_IMAGE,
     )
 
-    print()
-    print(
-        "Saved:",
-        OUTPUT_IMAGE
-    )
+    # --------------------------------------------------------
+    # Remove temporary GeoTIFF
+    # --------------------------------------------------------
+
+    try:
+
+        TEMP_GEOTIFF.unlink()
+
+        print(
+            "Temporary GeoTIFF removed."
+        )
+
+    except FileNotFoundError:
+
+        pass
 
     # --------------------------------------------------------
     # Metadata
@@ -1142,10 +1067,10 @@ def main():
                 OUTPUT_IMAGE.name,
 
             "width":
-                clipped.width,
+                final_image.width,
 
             "height":
-                clipped.height,
+                final_image.height,
 
         },
 
@@ -1180,6 +1105,17 @@ def main():
                 maxy,
 
             "file":
+                "IRAN.geojson",
+
+        },
+
+        "georeferencing": {
+
+            "method":
+                "EPSG:4326 georeferenced GeoTIFF "
+                "followed by geographic mask",
+
+            "clip":
                 "IRAN.geojson",
 
         },
