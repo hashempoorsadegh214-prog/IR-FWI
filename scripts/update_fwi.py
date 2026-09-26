@@ -2,6 +2,7 @@
 
 import io
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -33,11 +34,13 @@ WMS_URL = "https://maps.effis.emergency.copernicus.eu/gwis"
 
 LAYER_NAME = "ecmwf.fwi"
 
-# تصویر با عرض ثابت ساخته می‌شود.
-# ارتفاع بعداً بر اساس نسبت واقعی BBOX محاسبه می‌شود.
 IMAGE_WIDTH = 2200
 
 TIMEOUT = 180
+
+MAX_DOWNLOAD_ATTEMPTS = 5
+
+RETRY_WAIT_SECONDS = 10
 
 
 # ============================================================
@@ -51,7 +54,9 @@ def load_iran_boundary():
             f"Iran boundary not found: {BOUNDARY_FILE}"
         )
 
-    gdf = gpd.read_file(BOUNDARY_FILE)
+    gdf = gpd.read_file(
+        BOUNDARY_FILE
+    )
 
     if gdf.empty:
         raise RuntimeError(
@@ -65,13 +70,19 @@ def load_iran_boundary():
             "Assuming EPSG:4326."
         )
 
-        gdf = gdf.set_crs("EPSG:4326")
+        gdf = gdf.set_crs(
+            "EPSG:4326"
+        )
 
     else:
 
-        gdf = gdf.to_crs("EPSG:4326")
+        gdf = gdf.to_crs(
+            "EPSG:4326"
+        )
 
-    geometry = unary_union(gdf.geometry)
+    geometry = unary_union(
+        gdf.geometry
+    )
 
     if geometry.is_empty:
         raise RuntimeError(
@@ -87,12 +98,13 @@ def load_iran_boundary():
 
 def get_bbox(geometry):
 
-    minx, miny, maxx, maxy = geometry.bounds
+    minx, miny, maxx, maxy = (
+        geometry.bounds
+    )
 
     width = maxx - minx
     height = maxy - miny
 
-    # فقط برای درخواست WMS مقدار کمی حاشیه اضافه می‌کنیم.
     margin_x = width * 0.01
     margin_y = height * 0.01
 
@@ -112,33 +124,44 @@ def get_image_dimensions(bbox):
 
     minx, miny, maxx, maxy = bbox
 
-    geographic_width = maxx - minx
-    geographic_height = maxy - miny
+    geographic_width = (
+        maxx - minx
+    )
+
+    geographic_height = (
+        maxy - miny
+    )
 
     if geographic_width <= 0:
+
         raise RuntimeError(
             "Invalid BBOX width."
         )
 
     if geographic_height <= 0:
+
         raise RuntimeError(
             "Invalid BBOX height."
         )
 
-    # نسبت تصویر باید دقیقاً با نسبت جغرافیایی BBOX
-    # یکسان باشد.
     image_height = round(
-        IMAGE_WIDTH *
-        geographic_height /
+        IMAGE_WIDTH
+        *
+        geographic_height
+        /
         geographic_width
     )
 
     if image_height <= 0:
+
         raise RuntimeError(
             "Calculated image height is invalid."
         )
 
-    return IMAGE_WIDTH, image_height
+    return (
+        IMAGE_WIDTH,
+        image_height,
+    )
 
 
 # ============================================================
@@ -160,7 +183,9 @@ def geometry_to_pixel_mask(
         0,
     )
 
-    draw = ImageDraw.Draw(mask)
+    draw = ImageDraw.Draw(
+        mask
+    )
 
     def to_pixel(x, y):
 
@@ -199,22 +224,20 @@ def geometry_to_pixel_mask(
                 fill=255,
             )
 
-    geojson = mapping(geometry)
-
-    # --------------------------------------------------------
-    # Polygon
-    # --------------------------------------------------------
+    geojson = mapping(
+        geometry
+    )
 
     if geojson["type"] == "Polygon":
 
-        coordinates = geojson["coordinates"]
+        coordinates = (
+            geojson["coordinates"]
+        )
 
-        # Exterior
         draw_polygon(
             coordinates[0]
         )
 
-        # Holes
         for hole in coordinates[1:]:
 
             pixels = [
@@ -229,20 +252,16 @@ def geometry_to_pixel_mask(
                     fill=0,
                 )
 
-    # --------------------------------------------------------
-    # MultiPolygon
-    # --------------------------------------------------------
-
     elif geojson["type"] == "MultiPolygon":
 
-        for polygon in geojson["coordinates"]:
+        for polygon in (
+            geojson["coordinates"]
+        ):
 
-            # Exterior
             draw_polygon(
                 polygon[0]
             )
 
-            # Holes
             for hole in polygon[1:]:
 
                 pixels = [
@@ -277,7 +296,9 @@ def clip_image_to_boundary(
     bbox,
 ):
 
-    image = image.convert("RGBA")
+    image = image.convert(
+        "RGBA"
+    )
 
     mask = geometry_to_pixel_mask(
         geometry=geometry,
@@ -286,9 +307,10 @@ def clip_image_to_boundary(
         height=image.height,
     )
 
-    alpha = image.getchannel("A")
+    alpha = image.getchannel(
+        "A"
+    )
 
-    # فقط قسمت داخل مرز ایران باقی می‌ماند.
     combined_alpha = Image.composite(
         alpha,
         Image.new(
@@ -352,6 +374,20 @@ def download_fwi(
             target_date,
     }
 
+    headers = {
+
+        "User-Agent":
+            "IR-FWI/1.0 "
+            "(GitHub Actions)",
+
+        "Accept":
+            "image/png,image/*;q=0.9,*/*;q=0.8",
+
+        "Connection":
+            "close",
+    }
+
+    print()
     print(
         "Downloading ECMWF FWI..."
     )
@@ -386,52 +422,150 @@ def download_fwi(
         image_height
     )
 
-    response = requests.get(
-        WMS_URL,
-        params=params,
-        timeout=TIMEOUT,
-    )
+    last_error = None
 
-    response.raise_for_status()
+    for attempt in range(
+        1,
+        MAX_DOWNLOAD_ATTEMPTS + 1,
+    ):
 
-    content_type = (
-        response.headers.get(
-            "Content-Type",
-            ""
-        )
-    )
-
-    print(
-        "HTTP status:",
-        response.status_code
-    )
-
-    print(
-        "Content-Type:",
-        content_type
-    )
-
-    print(
-        "Downloaded:",
-        len(response.content),
-        "bytes"
-    )
-
-    if "image" not in content_type.lower():
-
+        print()
         print(
-            response.text[:1000]
+            f"Download attempt "
+            f"{attempt}/{MAX_DOWNLOAD_ATTEMPTS}"
         )
 
-        raise RuntimeError(
-            "GWIS did not return an image."
-        )
+        try:
 
-    return Image.open(
-        io.BytesIO(
-            response.content
-        )
-    ).convert("RGBA")
+            session = requests.Session()
+
+            response = session.get(
+                WMS_URL,
+                params=params,
+                headers=headers,
+                timeout=TIMEOUT,
+                stream=True,
+            )
+
+            response.raise_for_status()
+
+            content_type = (
+                response.headers.get(
+                    "Content-Type",
+                    ""
+                )
+            )
+
+            print(
+                "HTTP status:",
+                response.status_code
+            )
+
+            print(
+                "Content-Type:",
+                content_type
+            )
+
+            if (
+                "image"
+                not in
+                content_type.lower()
+            ):
+
+                text = (
+                    response.text[:1000]
+                )
+
+                raise RuntimeError(
+                    "GWIS did not return an image.\n"
+                    f"Response:\n{text}"
+                )
+
+            chunks = []
+
+            total_bytes = 0
+
+            for chunk in response.iter_content(
+                chunk_size=64 * 1024
+            ):
+
+                if chunk:
+
+                    chunks.append(
+                        chunk
+                    )
+
+                    total_bytes += len(
+                        chunk
+                    )
+
+            response.close()
+
+            session.close()
+
+            content = b"".join(
+                chunks
+            )
+
+            print(
+                "Downloaded:",
+                total_bytes,
+                "bytes"
+            )
+
+            if total_bytes == 0:
+
+                raise RuntimeError(
+                    "GWIS returned an empty image."
+                )
+
+            image = Image.open(
+                io.BytesIO(content)
+            ).convert("RGBA")
+
+            print(
+                "Received image size:",
+                image.size
+            )
+
+            return image
+
+        except Exception as exc:
+
+            last_error = exc
+
+            print()
+            print(
+                "Download failed:"
+            )
+
+            print(
+                repr(exc)
+            )
+
+            if attempt < MAX_DOWNLOAD_ATTEMPTS:
+
+                print(
+                    f"Waiting "
+                    f"{RETRY_WAIT_SECONDS} "
+                    f"seconds before retry..."
+                )
+
+                time.sleep(
+                    RETRY_WAIT_SECONDS
+                )
+
+            else:
+
+                print(
+                    "All download attempts failed."
+                )
+
+    raise RuntimeError(
+        "Unable to download FWI from "
+        "Copernicus GWIS after "
+        f"{MAX_DOWNLOAD_ATTEMPTS} attempts."
+    ) from last_error
 
 
 # ============================================================
@@ -454,7 +588,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Load Iran boundary
+    # Load boundary
     # --------------------------------------------------------
 
     iran_geometry = (
@@ -528,7 +662,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Calculate image dimensions
+    # Image dimensions
     # --------------------------------------------------------
 
     image_width, image_height = (
@@ -552,21 +686,27 @@ def main():
         image_height
     )
 
+    geographic_aspect_ratio = (
+        (bbox[2] - bbox[0])
+        /
+        (bbox[3] - bbox[1])
+    )
+
+    image_aspect_ratio = (
+        image_width
+        /
+        image_height
+    )
+
     print()
     print(
         "Geographic aspect ratio:",
-        (
-            bbox[2] - bbox[0]
-        )
-        /
-        (
-            bbox[3] - bbox[1]
-        )
+        geographic_aspect_ratio
     )
 
     print(
         "Image aspect ratio:",
-        image_width / image_height
+        image_aspect_ratio
     )
 
     # --------------------------------------------------------
@@ -595,7 +735,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Download FWI
+    # Download
     # --------------------------------------------------------
 
     image = download_fwi(
@@ -605,14 +745,15 @@ def main():
         image_height=image_height,
     )
 
+    # --------------------------------------------------------
+    # Validate image size
+    # --------------------------------------------------------
+
+    print()
     print(
         "Downloaded image size:",
         image.size
     )
-
-    # --------------------------------------------------------
-    # Safety check
-    # --------------------------------------------------------
 
     if image.size != (
         image_width,
@@ -625,9 +766,10 @@ def main():
         )
 
     # --------------------------------------------------------
-    # Clip exactly to Iran boundary
+    # Clip to Iran
     # --------------------------------------------------------
 
+    print()
     print(
         "Clipping image to IRAN.geojson..."
     )
@@ -645,7 +787,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Save image
+    # Save PNG
     # --------------------------------------------------------
 
     clipped.save(
@@ -654,6 +796,7 @@ def main():
         optimize=True,
     )
 
+    print()
     print(
         "Saved:",
         OUTPUT_IMAGE
@@ -738,11 +881,13 @@ def main():
         encoding="utf-8",
     )
 
+    print()
     print(
         "Saved:",
         OUTPUT_JSON
     )
 
+    print()
     print("=" * 70)
 
     print(
