@@ -1,7 +1,7 @@
 {
   "source": "Copernicus GWIS / ECMWF",
   "layer": "ecmwf.fwi",
-  "date": "2026-10-21",
+  "date": "2026-10-22",
   "crs": "EPSG:4326",
   "image": {
     "file": "fwi_iran_latest.png",
@@ -44,5 +44,5 @@
     "tile_width": 800,
     "tile_height": 611
   },
-  "generated_at_utc": "2026-10-21T06:17:13.657882+00:00"
+  "generated_at_utc": "2026-10-22T06:20:37.627030+00:00"
 }
